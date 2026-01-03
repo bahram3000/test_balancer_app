@@ -8,12 +8,27 @@ import numpy as np
 import math
 from web3 import exceptions
 from eth_abi import encode
+from eth_utils import keccak
 import web3
 from web3.exceptions import ContractLogicError, TimeExhausted
 import logging
 from calculation import *
 import pickle
 import os
+import hashlib
+import base64
+import re
+from typing import Dict
+from eth_account.messages import encode_typed_data
+from tqdm import tqdm
+import secrets
+from eth_abi.packed import encode_packed
+
+
+
+
+
+
 logger = logging.getLogger(__name__)
 
 class Web3_Network(Web3):
@@ -48,6 +63,16 @@ class Web3_Network(Web3):
             if 'baseFeePerGas' in latest_block
             else 'LEGACY'
         )
+        #
+        self.get_explorer_api_url()
+    #
+    #
+    def get_explorer_api_url(self,inp_api_url: str=None):
+        if inp_api_url is not None:
+            self.api_url = inp_api_url
+        else:
+            self.api_url = "https://api.etherscan.io/v2/api"
+
     #
     #
     def get_network_name_from_api(self) -> str:
@@ -67,12 +92,28 @@ class Web3_Network(Web3):
         self.router_address=self.to_checksum_address(inp_router_address)
     #
     #
+    def get_universalrouter_address(self,inp_universalrouter_address: str):
+        self.universalrouter_address=self.to_checksum_address(inp_universalrouter_address)
+    #
+    #
     def get_factory_address(self,inp_factory_address: str):
         self.factory_address=self.to_checksum_address(inp_factory_address)
     #
     #
     def get_position_manager_address(self,inp_position_manager_address: str):
         self.position_manager_address=self.to_checksum_address(inp_position_manager_address)
+    #
+    #
+    def get_v4_position_manager_address(self,inp_v4_position_manager_address: str):
+        self.v4_position_manager_address=self.to_checksum_address(inp_v4_position_manager_address)
+    #
+    #
+    def get_pool_manager_address(self,pool_manager_address):
+        self.pool_manager_address=self.to_checksum_address(pool_manager_address)
+    #
+    #
+    def get_permit2_address(self,permit2_address:str):
+        self.permit2_address=self.to_checksum_address(permit2_address)
     #
     #
     def get_jitzap_address(self,inp_jitzap_address: str):
@@ -191,7 +232,9 @@ class Web3_Network(Web3):
             self.UNISWAP_V3_FACTORY_ABI=self.FACTORY_ABI_FALLBACK
     #
     #
-    def factory_contract(self, factory_address: str):
+    def build_factory_contract(self, factory_address: str=None):
+        if factory_address is None:
+            factory_address = self.factory_address
         self.GET_FACTORY_ABI(factory_address)
         self.factory_contract = self.eth.contract(address=factory_address, abi=self.UNISWAP_V3_FACTORY_ABI)
     #
@@ -201,7 +244,7 @@ class Web3_Network(Web3):
             #raise RuntimeError("Factory contract not initialized")
             if not hasattr(self, "factory_address"):
                 raise RuntimeError("Factory address not set")
-            self.factory_contract(self.factory_address)
+            self.build_factory_contract(self.factory_address)
 
         try:
             pool_address = self.factory_contract.functions.getPool(
@@ -456,6 +499,10 @@ class ABIRegistry(BaseEntity):
     def __init__(self, net: Web3_Network):
         super().__init__(net)
         self.abi_cache = {}  # In-memory cache for ABIs
+        self.load_abi_cache()
+        if not os.path.exists('abi_cache'):
+            os.makedirs('abi_cache', exist_ok=True)
+   
         self.ERC20_ABI_FALLBACK = [
             {
             "constant": True,
@@ -1040,6 +1087,469 @@ class ABIRegistry(BaseEntity):
                                                            {"internalType":"uint256","name":"amount1MinMint","type":"uint256"}],"name":"executeJIT","outputs":[],"stateMutability":"nonpayable","type":"function"},
                                                            {"inputs":[],"name":"nfpm","outputs":[{"internalType":"contract INonfungiblePositionManager","name":"","type":"address"}],"stateMutability":"view","type":"function"},
                                                            {"inputs":[],"name":"router","outputs":[{"internalType":"contract ISwapRouter","name":"","type":"address"}],"stateMutability":"view","type":"function"}]
+        self.V4_CONTRACT_ABI_FALLBACK=[
+    # =========================
+    # Constructor
+    # =========================
+    {
+        "type": "constructor",
+        "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "_poolManager", "type": "address"},
+            {"name": "_permit2", "type": "address"},
+            {"name": "_unsubscribeGasLimit", "type": "uint256"},
+            {"name": "_tokenDescriptor", "type": "address"},
+            {"name": "_weth9", "type": "address"},
+        ],
+    },
+
+    # =========================
+    # Errors
+    # =========================
+    {"type": "error", "name": "AlreadySubscribed", "inputs": [
+        {"name": "tokenId", "type": "uint256"},
+        {"name": "subscriber", "type": "address"},
+    ]},
+    {"type": "error", "name": "Unauthorized", "inputs": []},
+    {"type": "error", "name": "NotApproved", "inputs": [
+        {"name": "caller", "type": "address"},
+    ]},
+    {"type": "error", "name": "DeadlinePassed", "inputs": [
+        {"name": "deadline", "type": "uint256"},
+    ]},
+    {"type": "error", "name": "NotPoolManager", "inputs": []},
+    {"type": "error", "name": "UnsupportedAction", "inputs": [
+        {"name": "action", "type": "uint256"},
+    ]},
+
+    # =========================
+    # Events
+    # =========================
+    {
+        "type": "event",
+        "name": "Transfer",
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "name": "from", "type": "address"},
+            {"indexed": True, "name": "to", "type": "address"},
+            {"indexed": True, "name": "id", "type": "uint256"},
+        ],
+    },
+    {
+        "type": "event",
+        "name": "Approval",
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "name": "owner", "type": "address"},
+            {"indexed": True, "name": "spender", "type": "address"},
+            {"indexed": True, "name": "id", "type": "uint256"},
+        ],
+    },
+    {
+        "type": "event",
+        "name": "Subscription",
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "name": "tokenId", "type": "uint256"},
+            {"indexed": True, "name": "subscriber", "type": "address"},
+        ],
+    },
+    {
+        "type": "event",
+        "name": "Unsubscription",
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "name": "tokenId", "type": "uint256"},
+            {"indexed": True, "name": "subscriber", "type": "address"},
+        ],
+    },
+
+    # =========================
+    # ERC721 View
+    # =========================
+    {
+        "type": "function",
+        "name": "ownerOf",
+        "stateMutability": "view",
+        "inputs": [{"name": "tokenId", "type": "uint256"}],
+        "outputs": [{"type": "address"}],
+    },
+    {
+        "type": "function",
+        "name": "balanceOf",
+        "stateMutability": "view",
+        "inputs": [{"name": "owner", "type": "address"}],
+        "outputs": [{"type": "uint256"}],
+    },
+
+    # =========================
+    # Pool / Position
+    # =========================
+    {
+        "type": "function",
+        "name": "getPositionLiquidity",
+        "stateMutability": "view",
+        "inputs": [{"name": "tokenId", "type": "uint256"}],
+        "outputs": [{"name": "liquidity", "type": "uint128"}],
+    },
+    {
+        "type": "function",
+        "name": "getPoolAndPositionInfo",
+        "stateMutability": "view",
+        "inputs": [{"name": "tokenId", "type": "uint256"}],
+        "outputs": [
+            {
+                "name": "poolKey",
+                "type": "tuple",
+                "components": [
+                    {"name": "currency0", "type": "address"},
+                    {"name": "currency1", "type": "address"},
+                    {"name": "fee", "type": "uint24"},
+                    {"name": "tickSpacing", "type": "int24"},
+                    {"name": "hooks", "type": "address"},
+                ],
+            },
+            {"name": "info", "type": "uint256"},
+        ],
+    },
+
+    # =========================
+    # Liquidity Management
+    # =========================
+    {
+        "type": "function",
+        "name": "modifyLiquidities",
+        "stateMutability": "payable",
+        "inputs": [
+            {"name": "unlockData", "type": "bytes"},
+            {"name": "deadline", "type": "uint256"},
+        ],
+        "outputs": [],
+    },
+    {
+        "type": "function",
+        "name": "modifyLiquiditiesWithoutUnlock",
+        "stateMutability": "payable",
+        "inputs": [
+            {"name": "actions", "type": "bytes"},
+            {"name": "params", "type": "bytes[]"},
+        ],
+        "outputs": [],
+    },
+
+    # =========================
+    # Subscription
+    # =========================
+    {
+        "type": "function",
+        "name": "subscribe",
+        "stateMutability": "payable",
+        "inputs": [
+            {"name": "tokenId", "type": "uint256"},
+            {"name": "newSubscriber", "type": "address"},
+            {"name": "data", "type": "bytes"},
+        ],
+        "outputs": [],
+    },
+    {
+        "type": "function",
+        "name": "unsubscribe",
+        "stateMutability": "payable",
+        "inputs": [{"name": "tokenId", "type": "uint256"}],
+        "outputs": [],
+    },
+
+    # =========================
+    # Multicall
+    # =========================
+    {
+        "type": "function",
+        "name": "multicall",
+        "stateMutability": "payable",
+        "inputs": [{"name": "data", "type": "bytes[]"}],
+        "outputs": [{"type": "bytes[]"}],
+    },
+]
+        self.V4_POOL_MANAGER_ABI_FALLBACK = [
+    {
+        "inputs": [{"internalType": "address", "name": "initialOwner", "type": "address"}],
+        "stateMutability": "nonpayable",
+        "type": "constructor",
+    },
+
+    # ───────────── Errors ─────────────
+    {"inputs": [], "name": "AlreadyUnlocked", "type": "error"},
+    {"inputs": [
+        {"internalType": "address", "name": "currency0", "type": "address"},
+        {"internalType": "address", "name": "currency1", "type": "address"},
+    ], "name": "CurrenciesOutOfOrderOrEqual", "type": "error"},
+    {"inputs": [], "name": "CurrencyNotSettled", "type": "error"},
+    {"inputs": [], "name": "DelegateCallNotAllowed", "type": "error"},
+    {"inputs": [], "name": "InvalidCaller", "type": "error"},
+    {"inputs": [], "name": "ManagerLocked", "type": "error"},
+    {"inputs": [], "name": "MustClearExactPositiveDelta", "type": "error"},
+    {"inputs": [], "name": "NonzeroNativeValue", "type": "error"},
+    {"inputs": [], "name": "PoolNotInitialized", "type": "error"},
+    {"inputs": [], "name": "ProtocolFeeCurrencySynced", "type": "error"},
+    {"inputs": [{"internalType": "uint24", "name": "fee", "type": "uint24"}], "name": "ProtocolFeeTooLarge", "type": "error"},
+    {"inputs": [], "name": "SwapAmountCannotBeZero", "type": "error"},
+    {"inputs": [{"internalType": "int24", "name": "tickSpacing", "type": "int24"}], "name": "TickSpacingTooLarge", "type": "error"},
+    {"inputs": [{"internalType": "int24", "name": "tickSpacing", "type": "int24"}], "name": "TickSpacingTooSmall", "type": "error"},
+    {"inputs": [], "name": "UnauthorizedDynamicLPFeeUpdate", "type": "error"},
+
+    # ───────────── Events ─────────────
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "internalType": "PoolId", "name": "id", "type": "bytes32"},
+            {"indexed": True, "internalType": "address", "name": "sender", "type": "address"},
+            {"indexed": False, "internalType": "int128", "name": "amount0", "type": "int128"},
+            {"indexed": False, "internalType": "int128", "name": "amount1", "type": "int128"},
+            {"indexed": False, "internalType": "uint160", "name": "sqrtPriceX96", "type": "uint160"},
+            {"indexed": False, "internalType": "uint128", "name": "liquidity", "type": "uint128"},
+            {"indexed": False, "internalType": "int24", "name": "tick", "type": "int24"},
+            {"indexed": False, "internalType": "uint24", "name": "fee", "type": "uint24"},
+        ],
+        "name": "Swap",
+        "type": "event",
+    },
+
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "internalType": "PoolId", "name": "id", "type": "bytes32"},
+            {"indexed": True, "internalType": "address", "name": "sender", "type": "address"},
+            {"indexed": False, "internalType": "int24", "name": "tickLower", "type": "int24"},
+            {"indexed": False, "internalType": "int24", "name": "tickUpper", "type": "int24"},
+            {"indexed": False, "internalType": "int256", "name": "liquidityDelta", "type": "int256"},
+            {"indexed": False, "internalType": "bytes32", "name": "salt", "type": "bytes32"},
+        ],
+        "name": "ModifyLiquidity",
+        "type": "event",
+    },
+
+    # ───────────── View Functions ─────────────
+    {
+        "inputs": [{"internalType": "Currency", "name": "currency", "type": "address"}],
+        "name": "protocolFeesAccrued",
+        "outputs": [{"internalType": "uint256", "name": "amount", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+
+    {
+        "inputs": [],
+        "name": "owner",
+        "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+
+    # ───────────── Core Functions ─────────────
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"internalType": "Currency", "name": "currency0", "type": "address"},
+                    {"internalType": "Currency", "name": "currency1", "type": "address"},
+                    {"internalType": "uint24", "name": "fee", "type": "uint24"},
+                    {"internalType": "int24", "name": "tickSpacing", "type": "int24"},
+                    {"internalType": "contract IHooks", "name": "hooks", "type": "address"},
+                ],
+                "internalType": "struct PoolKey",
+                "name": "key",
+                "type": "tuple",
+            },
+            {
+                "components": [
+                    {"internalType": "bool", "name": "zeroForOne", "type": "bool"},
+                    {"internalType": "int256", "name": "amountSpecified", "type": "int256"},
+                    {"internalType": "uint160", "name": "sqrtPriceLimitX96", "type": "uint160"},
+                ],
+                "internalType": "struct IPoolManager.SwapParams",
+                "name": "params",
+                "type": "tuple",
+            },
+            {"internalType": "bytes", "name": "hookData", "type": "bytes"},
+        ],
+        "name": "swap",
+        "outputs": [{"internalType": "BalanceDelta", "name": "swapDelta", "type": "int256"}],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+
+    {
+        "inputs": [{"internalType": "bytes", "name": "data", "type": "bytes"}],
+        "name": "unlock",
+        "outputs": [{"internalType": "bytes", "name": "result", "type": "bytes"}],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+        self.UNIVERSAL_ROUTER_ABI_FALLBACK= [
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"internalType": "address", "name": "permit2", "type": "address"},
+                    {"internalType": "address", "name": "weth9", "type": "address"},
+                    {"internalType": "address", "name": "v2Factory", "type": "address"},
+                    {"internalType": "address", "name": "v3Factory", "type": "address"},
+                    {"internalType": "bytes32", "name": "pairInitCodeHash", "type": "bytes32"},
+                    {"internalType": "bytes32", "name": "poolInitCodeHash", "type": "bytes32"},
+                    {"internalType": "address", "name": "v4PoolManager", "type": "address"},
+                    {"internalType": "address", "name": "v3NFTPositionManager", "type": "address"},
+                    {"internalType": "address", "name": "v4PositionManager", "type": "address"},
+                ],
+                "internalType": "struct RouterParameters",
+                "name": "params",
+                "type": "tuple",
+            }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "constructor",
+    },
+    {"inputs": [], "name": "BalanceTooLow", "type": "error"},
+    {"inputs": [], "name": "ContractLocked", "type": "error"},
+    {"inputs": [{"internalType": "Currency", "name": "currency", "type": "address"}], "name": "DeltaNotNegative", "type": "error"},
+    {"inputs": [{"internalType": "Currency", "name": "currency", "type": "address"}], "name": "DeltaNotPositive", "type": "error"},
+    {"inputs": [], "name": "ETHNotAccepted", "type": "error"},
+    {
+        "inputs": [
+            {"internalType": "uint256", "name": "commandIndex", "type": "uint256"},
+            {"internalType": "bytes", "name": "message", "type": "bytes"},
+        ],
+        "name": "ExecutionFailed",
+        "type": "error",
+    },
+    {"inputs": [], "name": "FromAddressIsNotOwner", "type": "error"},
+    {"inputs": [], "name": "InputLengthMismatch", "type": "error"},
+    {"inputs": [], "name": "InsufficientBalance", "type": "error"},
+    {"inputs": [], "name": "InsufficientETH", "type": "error"},
+    {"inputs": [], "name": "InsufficientToken", "type": "error"},
+    {
+        "inputs": [{"internalType": "bytes4", "name": "action", "type": "bytes4"}],
+        "name": "InvalidAction",
+        "type": "error",
+    },
+    {"inputs": [], "name": "InvalidBips", "type": "error"},
+    {
+        "inputs": [{"internalType": "uint256", "name": "commandType", "type": "uint256"}],
+        "name": "InvalidCommandType",
+        "type": "error",
+    },
+    {"inputs": [], "name": "InvalidEthSender", "type": "error"},
+    {"inputs": [], "name": "InvalidPath", "type": "error"},
+    {"inputs": [], "name": "InvalidReserves", "type": "error"},
+    {"inputs": [], "name": "LengthMismatch", "type": "error"},
+    {
+        "inputs": [{"internalType": "uint256", "name": "tokenId", "type": "uint256"}],
+        "name": "NotAuthorizedForToken",
+        "type": "error",
+    },
+    {"inputs": [], "name": "NotPoolManager", "type": "error"},
+    {"inputs": [], "name": "OnlyMintAllowed", "type": "error"},
+    {"inputs": [], "name": "SliceOutOfBounds", "type": "error"},
+    {"inputs": [], "name": "TransactionDeadlinePassed", "type": "error"},
+    {"inputs": [], "name": "UnsafeCast", "type": "error"},
+    {
+        "inputs": [{"internalType": "uint256", "name": "action", "type": "uint256"}],
+        "name": "UnsupportedAction",
+        "type": "error",
+    },
+    {"inputs": [], "name": "V2InvalidPath", "type": "error"},
+    {"inputs": [], "name": "V2TooLittleReceived", "type": "error"},
+    {"inputs": [], "name": "V2TooMuchRequested", "type": "error"},
+    {"inputs": [], "name": "V3InvalidAmountOut", "type": "error"},
+    {"inputs": [], "name": "V3InvalidCaller", "type": "error"},
+    {"inputs": [], "name": "V3InvalidSwap", "type": "error"},
+    {"inputs": [], "name": "V3TooLittleReceived", "type": "error"},
+    {"inputs": [], "name": "V3TooMuchRequested", "type": "error"},
+    {
+        "inputs": [
+            {"internalType": "uint256", "name": "minAmountOutReceived", "type": "uint256"},
+            {"internalType": "uint256", "name": "amountReceived", "type": "uint256"},
+        ],
+        "name": "V4TooLittleReceived",
+        "type": "error",
+    },
+    {
+        "inputs": [
+            {"internalType": "uint256", "name": "maxAmountInRequested", "type": "uint256"},
+            {"internalType": "uint256", "name": "amountRequested", "type": "uint256"},
+        ],
+        "name": "V4TooMuchRequested",
+        "type": "error",
+    },
+    {
+        "inputs": [],
+        "name": "V3_POSITION_MANAGER",
+        "outputs": [{"internalType": "contract INonfungiblePositionManager", "name": "", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "V4_POSITION_MANAGER",
+        "outputs": [{"internalType": "contract IPositionManager", "name": "", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "bytes", "name": "commands", "type": "bytes"},
+            {"internalType": "bytes[]", "name": "inputs", "type": "bytes[]"},
+        ],
+        "name": "execute",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "bytes", "name": "commands", "type": "bytes"},
+            {"internalType": "bytes[]", "name": "inputs", "type": "bytes[]"},
+            {"internalType": "uint256", "name": "deadline", "type": "uint256"},
+        ],
+        "name": "execute",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "msgSender",
+        "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "poolManager",
+        "outputs": [{"internalType": "contract IPoolManager", "name": "", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "int256", "name": "amount0Delta", "type": "int256"},
+            {"internalType": "int256", "name": "amount1Delta", "type": "int256"},
+            {"internalType": "bytes", "name": "data", "type": "bytes"},
+        ],
+        "name": "uniswapV3SwapCallback",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [{"internalType": "bytes", "name": "data", "type": "bytes"}],
+        "name": "unlockCallback",
+        "outputs": [{"internalType": "bytes", "name": "", "type": "bytes"}],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {"stateMutability": "payable", "type": "receive"},
+]
     #
     #
     def GET_ERC20_ABI(self, token_address: str) -> list:
@@ -1049,6 +1559,8 @@ class ABIRegistry(BaseEntity):
         ERC20_ABI=self.net.fetch_abi_retry(token_address)
         if ERC20_ABI:
             self.abi_cache[token_address]=ERC20_ABI
+            with open(f'abi_cache\\abi_{token_address}.json', 'w') as f:
+                json.dump(ERC20_ABI, f, indent=4)
             return ERC20_ABI
         else:
             return self.ERC20_ABI_FALLBACK
@@ -1063,6 +1575,8 @@ class ABIRegistry(BaseEntity):
         NFPM_ABI=self.net.fetch_abi_retry(nfpm_address)
         if NFPM_ABI:
             self.abi_cache[nfpm_address]=NFPM_ABI
+            with open(f'abi_cache\\abi_{nfpm_address}.json', 'w') as f:
+                json.dump(NFPM_ABI, f, indent=4)
             return NFPM_ABI
         else:
             return self.NFPM_ABI_FALLBACK
@@ -1075,9 +1589,27 @@ class ABIRegistry(BaseEntity):
         V3_POOL_ABI=self.net.fetch_abi_retry(pool_address)
         if V3_POOL_ABI:
             self.abi_cache[pool_address]=V3_POOL_ABI
+            with open(f'abi_cache\\abi_{pool_address}.json', 'w') as f:
+                json.dump(V3_POOL_ABI, f, indent=4)
             return V3_POOL_ABI
         else:
             return self.V3_POOL_ABI_FALLBACK
+    #
+    #
+    def GET_V4_PM_ABI(self, v4_pm_address: str=None) -> list:
+        if v4_pm_address is None:
+            v4_pm_address=self.net.v4_position_manager_address
+        v4_pm_address=self.net.to_checksum_address(v4_pm_address)
+        if v4_pm_address in self.abi_cache.keys():
+            return self.abi_cache[v4_pm_address]
+        V4_PM_ABI=self.net.fetch_abi_retry(v4_pm_address)
+        if V4_PM_ABI:
+            self.abi_cache[v4_pm_address]=V4_PM_ABI
+            with open(f'abi_cache\\abi_{v4_pm_address}.json', 'w') as f:
+                json.dump(V4_PM_ABI, f, indent=4)
+            return V4_PM_ABI
+        else:
+            return self.V4_CONTRACT_ABI_FALLBACK
     #
     #
     def GET_ROUTER_ABI(self, router_address: str=None) -> list:
@@ -1089,6 +1621,8 @@ class ABIRegistry(BaseEntity):
         ROUTER_ABI=self.net.fetch_abi_retry(router_address)
         if ROUTER_ABI:
             self.abi_cache[router_address]=ROUTER_ABI
+            with open(f'abi_cache\\abi_{router_address}.json', 'w') as f:
+                json.dump(ROUTER_ABI, f, indent=4)
             return ROUTER_ABI
         else:
             return self.V3_ROUTER_ABI_FALLBACK
@@ -1103,9 +1637,27 @@ class ABIRegistry(BaseEntity):
         FACTORY_ABI=self.net.fetch_abi_retry(factory_address)
         if FACTORY_ABI:
             self.abi_cache[factory_address]=FACTORY_ABI
+            with open(f'abi_cache\\abi_{factory_address}.json', 'w') as f:
+                json.dump(FACTORY_ABI, f, indent=4)
             return FACTORY_ABI
         else:
             return self.FACTORY_ABI_FALLBACK
+    #
+    #
+    def GET_UNIVERSALROUTER_ABI(self,universal_address:str=None):
+        if universal_address is None:
+            universal_address=self.net.universalrouter_address
+        universal_address=self.net.to_checksum_address(universal_address)
+        if universal_address in self.abi_cache.keys():
+            return self.abi_cache[universal_address]
+        UNIVERSALROUTER_ABI=self.net.fetch_abi_retry(universal_address)
+        if UNIVERSALROUTER_ABI:
+            self.abi_cache[universal_address]=UNIVERSALROUTER_ABI
+            with open(f'abi_cache\\abi_{universal_address}.json', 'w') as f:
+                json.dump(UNIVERSALROUTER_ABI, f, indent=4)
+            return UNIVERSALROUTER_ABI
+        else:
+            return self.UNIVERSALROUTER_ABI_FALLBACK
     #
     #
     def GET_JITZAP_ABI(self,JITZAP_ADDRESS:str=None) -> list:
@@ -1117,10 +1669,26 @@ class ABIRegistry(BaseEntity):
         JITZAP_ABI=self.net.fetch_abi_retry(JITZAP_ADDRESS)
         if JITZAP_ABI:
             self.abi_cache[JITZAP_ADDRESS]=JITZAP_ABI
+            with open(f'abi_cache\\abi_{JITZAP_ADDRESS}.json', 'w') as f:
+                json.dump(JITZAP_ABI, f, indent=4)
             return JITZAP_ABI
         else:
             self.abi_cache[self.net.jitzap_address]=self.JIT_ZAP_ABI_FALLBACK
             return self.JIT_ZAP_ABI_FALLBACK
+    #
+    #
+    def GET_V4_POOL_MANAGER_ABI(self, v4_pool_manager_address: str=None) -> list:
+        v4_pool_manager_address=self.net.to_checksum_address(v4_pool_manager_address)
+        if v4_pool_manager_address in self.abi_cache.keys():
+            return self.abi_cache[v4_pool_manager_address]
+        V4_POOL_MANAGER_ABI=self.net.fetch_abi_retry(v4_pool_manager_address)
+        if V4_POOL_MANAGER_ABI:
+            self.abi_cache[v4_pool_manager_address]=V4_POOL_MANAGER_ABI
+            with open(f'abi_cache\\abi_{v4_pool_manager_address}.json', 'w') as f:
+                json.dump(V4_POOL_MANAGER_ABI, f, indent=4)
+            return V4_POOL_MANAGER_ABI
+        else:
+            return self.V4_POOL_MANAGER_ABI_FALLBACK
     #
     #
     def GET_ANY_CONTRACT_ABI(self, contract_address: str) -> list:
@@ -1130,6 +1698,8 @@ class ABIRegistry(BaseEntity):
         ABI=self.net.fetch_abi_retry(contract_address)
         if ABI:
             self.abi_cache[contract_address]=ABI
+            with open(f'abi_cache\\abi_{contract_address}.json', 'w') as f:
+                json.dump(ABI, f, indent=4)
             return ABI
         else:
             return []
@@ -1161,43 +1731,69 @@ class ABIRegistry(BaseEntity):
 #
 class Token(BaseEntity):
     def __init__(self, net: Web3_Network,abi_reg:ABIRegistry ,address: str):
+        ADDRESS_ZERO = "0x0000000000000000000000000000000000000000"
+        ETH_PSEUDO_ADDRESS = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
         super().__init__(net)
         self.abi_reg = abi_reg
 
         self.address = net.to_checksum_address(address)
+        self.is_native = (self.address.lower() == ADDRESS_ZERO.lower()) or \
+                         (self.address.lower() == ETH_PSEUDO_ADDRESS.lower())
+        
         self.contract = None
-
         self.name: str | None = None
         self.symbol: str | None = None
         self.decimals: int | None = None
         self.load()
+    #
+    #
     def load(self):
-        erc20abi=self.abi_reg.GET_ERC20_ABI(self.address)
+        if self.is_native:
+            self.name = "Native Ether"
+            self.symbol = "ETH"
+            self.decimals = 18
+            self.contract = None
+            self.balance_of()
+        else:
+            erc20abi=self.abi_reg.GET_ERC20_ABI(self.address)
+            if erc20abi is None:
+                raise ValueError(f"Cannot load ERC20 ABI for {self.address}")
 
-        self.contract = self.net.eth.contract(
-            address=self.address,
-            abi=erc20abi
-        )
+            self.contract = self.net.eth.contract(
+                address=self.address,
+                abi=erc20abi
+            )
 
-        #self.name = self.contract.functions.name().call()
-        self.symbol = self.contract.functions.symbol().call()
-        self.decimals = self.contract.functions.decimals().call()
-        self.balance_of()
-
+            self.name = self.contract.functions.name().call()
+            self.symbol = self.contract.functions.symbol().call()
+            self.decimals = self.contract.functions.decimals().call()
+            self.balance_of()
+    #
+    #
     def balance_of(self, address: str=None) -> int:
         if address is None:
             address = self.net.account.address
+        if self.is_native:
+            self.token_balance = self.net.eth.get_balance(address)
+        else:
             self.token_balance = self.contract.functions.balanceOf(
-                self.net.to_checksum_address(address)
-                ).call()
-
+                    self.net.to_checksum_address(address)
+                    ).call()
+    #
+    #
     def allowance(self, owner: str, spender: str) -> int:
+        if self.is_native:
+            return True
         return self.contract.functions.allowance(
             self.net.to_checksum_address(owner),
             self.net.to_checksum_address(spender)
         ).call()
-
+    #
+    #
     def ensure_allowance(self, spender: str, amount: int, infinite: bool = True) -> bool:
+        if self.is_native:
+            return True
+        
         self.load()
         spender = self.net.to_checksum_address(spender)
 
@@ -1254,6 +1850,249 @@ class Token(BaseEntity):
             return False
 
         return tx_hash
+    #
+    #
+    def supports_permit(self) -> bool:
+        """
+        Checks whether token supports EIP-2612 permit
+        """
+        if self.is_native:
+            return False
+
+        try:
+            # EIP-2612 requires nonces(address)
+            self.contract.functions.nonces(
+                self.net.account.address
+            ).call()
+            return True
+        except Exception:
+            return False
+    #
+    #
+    def permit(
+    self,
+    spender: str,
+    value: int,
+    deadline: int,
+    v: int,
+    r: bytes,
+    s: bytes
+    ) -> bool:
+        """
+        Executes EIP-2612 permit
+        """
+
+        if self.is_native:
+            return True
+
+        owner = self.net.account.address
+        spender = self.net.to_checksum_address(spender)
+
+        tx = self.contract.functions.permit(
+            owner,
+            spender,
+            value,
+            deadline,
+            v,
+            r,
+            s
+        )
+
+        tx_hash = self.net.build_and_send_transaction(
+            tx,
+            wait_for_confirmation=True
+        )
+
+        if not tx_hash:
+            raise RuntimeError(f"Permit failed for {self.symbol}")
+
+        return True
+    #
+    #
+    def approve(
+    self,
+    spender: str,
+    amount: int
+    ) -> bool:
+        """
+        Standard ERC20 approve
+        """
+
+        if self.is_native:
+            return True
+
+        spender = self.net.to_checksum_address(spender)
+
+        tx = self.contract.functions.approve(
+            spender,
+            amount
+        )
+
+        tx_hash = self.net.build_and_send_transaction(
+            tx,
+            wait_for_confirmation=True
+        )
+
+        if not tx_hash:
+            raise RuntimeError(f"Approve failed for {self.symbol}")
+
+        return True
+    #
+    #
+    def read_domain(self) -> dict:
+        if not self.supports_permit():
+            raise RuntimeError("Token does not support permit")
+        
+        name = self.contract.functions.name().call()
+
+        try:
+            version = self.contract.functions.version().call()
+        except:
+            try:
+                version = self.contract.functions.VERSION().call()
+            except:
+                version = "1"  # fallback safe default
+
+        self.version=version
+
+        return {
+            "name": name,
+            "version": version,
+            "chainId": self.net.chain_id,
+            "verifyingContract": self.address
+        }
+    #
+    #
+    def build_vrs(self,owner,spender,amount,nonce,deadline):
+        self.types = {
+            "EIP712Domain": [
+                {"name": "name", "type": "string"},
+                {"name": "version", "type": "string"},
+                {"name": "chainId", "type": "uint256"},
+                {"name": "verifyingContract", "type": "address"},
+            ],
+            "Permit": [
+                {"name": "owner", "type": "address"},
+                {"name": "spender", "type": "address"},
+                {"name": "value", "type": "uint256"},
+                {"name": "nonce", "type": "uint256"},
+                {"name": "deadline", "type": "uint256"},
+            ],
+        }
+        message = {
+        "owner": owner,
+        "spender": spender,
+        "value": amount,
+        "nonce": nonce,
+        "deadline": deadline,
+            }
+
+        domain=self.read_domain()
+        typed_data = {
+            "types": self.types,
+            "primaryType": "Permit",
+            "domain": domain,
+            "message": message,
+        }
+
+        encoded = encode_typed_data(full_message=typed_data)
+
+        '''encoded = encode_typed_data(
+            domain_data=self.version,
+            message_types=self.types,
+            message_data=message
+            )'''
+
+
+        signed = Account.sign_message(
+            encoded,
+            private_key=self.net.private_key
+        )
+
+        v = signed.v
+        r = signed.r
+        s = signed.s
+
+        message.update({
+            'v':v,
+            'r':r,
+            's':s})
+
+        return message
+    #
+    #
+    def ensure_allowance_smart(
+    self,
+    spender: str,
+    amount: int,
+    deadline=None,
+    infinite: bool = True,
+    permit_data: dict | None = None
+    ) -> bool:
+        """
+        Smart allowance handler:
+        - If allowance sufficient → OK
+        - If permit supported & data provided → try permit
+        - Fallback to approve
+        """
+
+        if self.is_native:
+            return True
+
+        self.load()
+        spender = self.net.to_checksum_address(spender)
+        owner = self.net.account.address
+
+        if deadline is None:
+            deadline=int(time.time())+300
+
+        current = self.allowance(owner, spender)
+        if current >= amount:
+            print("No need to approve...")
+            return True
+
+        # --- TRY PERMIT ---
+        if self.supports_permit():
+            if permit_data is None:
+                nonce = self.contract.functions.nonces(owner).call()
+                permit_data=self.build_vrs(owner,spender,amount,nonce,deadline)
+            try:
+                self.permit(
+                    spender=spender,
+                    value=permit_data["value"],
+                    deadline=permit_data["deadline"],
+                    v=permit_data["v"],
+                    r=permit_data["r"],
+                    s=permit_data["s"]
+                )
+
+                # re-check after permit
+                if self.allowance(owner, spender) >= amount:
+                    print("Permit Done for 5 Min ")
+                    return True
+
+            except Exception as e:
+                print(f"⚠️ permit failed, fallback to approve: {e}")
+
+        # --- FALLBACK APPROVE ---
+        if current > 0:
+            self.net.build_and_send_transaction(
+                self.contract.functions.approve(spender, 0),
+                wait_for_confirmation=True
+            )
+
+        approve_amount = (2**256 - 1) if infinite else amount
+
+        tx_hash = self.net.build_and_send_transaction_advanced(
+            self.contract.functions.approve(spender, approve_amount),
+            wait_for_confirmation=True
+        )
+
+        if not tx_hash:
+            raise RuntimeError(f"Approve failed for {self.symbol}")
+
+        return True
+
 #
 #
 #
@@ -1369,9 +2208,35 @@ class V3Pool(BaseEntity):
             lowertick=lowertick-step*inp_tickspacing
             uppertick=uppertick+step*inp_tickspacing
         return lowertick,uppertick
+    #-----------------------------------------------------------
+    #
+    def pool_state_after_swap_simple(
+    self,
+    swap_details,
+    amount_in: int
+    ):
+        sqrtP = self.sqrtPriceX96
+        L = self.liquidity
+        amount_in_int = int(amount_in)
+
+        #zero_for_one=True if swap_details=='token0 -> token1' else False
+        zero_for_one = (swap_details == 'token0 -> token1')
+
+        if zero_for_one:
+            # token0 -> token1 → price decreases
+            sqrtP_after = sqrtP - (amount_in * (1 << 96)) // L
+
+        else:
+            # token1 -> token0 → price increases
+            sqrtP_after = sqrtP + (amount_in * (1 << 96)) // L
+
+        tick_after = get_tick_from_sqrt_price(sqrtP_after)
+
+        return tick_after
+
     #
     #---------------------------------------------------------
-    def get_token(self)->tuple[Token,Token]:
+    def get_tokens(self)->tuple[Token,Token]:
         return [Token(self.net,self.abi_reg ,self.token0),Token(self.net,self.abi_reg ,self.token1)]
     #---------------------------------------------------------
     def info(self) -> dict:
@@ -1391,6 +2256,8 @@ class V3Pool(BaseEntity):
             "tickspacing": self.tickspacing
 
         }
+    #
+    #
 #
 #
 #
@@ -1626,22 +2493,744 @@ class SwapRouter(BaseEntity):
 #
 #
 #
+class UniversalRouter(BaseEntity):
+    def __init__(self, net: Web3_Network, abi_reg: ABIRegistry, address: str | None = None):
+        super().__init__(net)
+        self.abi_reg = abi_reg
+        if address is None:
+            address = self.net.universalrouter_address
+        self.address = net.to_checksum_address(address)
+        
+        # Initialize contract with the correct ABI from Registry
+        self.contract = net.eth.contract(
+            address=self.address, 
+            abi=self.abi_reg.GET_UNIVERSALROUTER_ABI(self.address)
+        )
+
+        self.commands = bytearray()
+        self.inputs = []
+
+        # --- COMMANDS (Universal Router Top Level OpCodes) ---
+        self.V4_SWAP = 0x10
+        self.PERMIT2_PERMIT = 0x02
+        self.PERMIT2_TRANSFER_FROM = 0x03
+        self.SWEEP = 0x04
+        
+        # --- V4 ROUTER ACTIONS (Nested inside V4_SWAP / OpCode 0x10) ---
+        self.ACTION_SWAP_EXACT_IN_SINGLE = 0x06
+        self.ACTION_SETTLE_ALL = 0x0c      # Used for ERC20 payments
+        self.ACTION_TAKE_ALL = 0x0f        # Used to receive output tokens
+        self.ACTION_SETTLE_NATIVE = 0x0b   # Used for Native ETH payments
+    #
+    #
+    def encode_commands(self, commands):
+        return bytes(commands)
+    #
+    #
+    def encode_actions(self, actions):
+        return bytes(actions)
+    #
+    #
+    def encode_action_params(self, types, values):
+        return encode(types, values)
+    #
+    #
+    def encode_v4_swap_input(self, actions: bytes, params: list[bytes]) -> bytes:
+        # The UniversalRouter.v4Swap expects: (bytes actions, bytes[] params)
+        return encode(["bytes", "bytes[]"], [actions, params])
+        #
+    #
+    def build_execute_calldata(self, commands, inputs, deadline):
+
+        selector = keccak(text="execute(bytes,bytes[],uint256)")[:4]
+        
+        encoded_params = encode(
+            ["bytes", "bytes[]", "uint256"],
+            [commands, inputs, deadline]
+        )
+        
+        calldata = selector + encoded_params
+        print(f"DEBUG - Raw Calldata Created: {calldata.hex()}")
+        return calldata
+    #
+    #
+    def execute(self, commands: bytes, inputs: list[bytes], deadline: int, value: int = 0):
+        """
+        Returns the contract function object (tx_func) to be processed 
+        by build_and_send_transaction_advanced.
+        """
+        # Create the function object without building/signing it yet
+        tx_func = self.contract.functions.execute(commands, inputs, deadline)
+        
+        # Delegate the rest (gas, nonce, sign, send) to your advanced sender
+        return self.net.build_and_send_transaction_advanced(
+            tx_func=tx_func,
+            sender=self.net.address,
+            value=value
+        )
+    #
+    #
+    @staticmethod
+    def generate_safe_nonce():
+        # uint48 max = 2**48 - 1
+        return secrets.randbits(48) & ((1 << 48) - 1)
+    #
+    #
+    def build_vrs(self, token_address: str, amount: int, nonce: int = None):
+        if nonce is None:
+            nonce = self.generate_safe_nonce()
+        deadline = int(time.time()) + 300  #
+
+        #
+        domain = {
+            "name": "Permit2",
+            "chainId": self.net.chain_id,
+            "verifyingContract": self.net.permit2_address
+        }
+
+        #
+        types = {
+            "EIP712Domain": [
+                {"name": "name", "type": "string"},
+                {"name": "chainId", "type": "uint256"},
+                {"name": "verifyingContract", "type": "address"},
+            ],
+            "PermitSingle": [
+                {"name": "permitted", "type": "TokenPermissions"},
+                {"name": "nonce", "type": "uint256"},
+                {"name": "deadline", "type": "uint256"},
+            ],
+            "TokenPermissions": [
+                {"name": "token", "type": "address"},
+                {"name": "amount", "type": "uint256"},
+            ],
+        }
+
+        #
+        message = {
+            "permitted": {
+                "token": token_address,
+                "amount": amount,
+            },
+            "nonce": nonce,
+            "deadline": deadline,
+        }
+
+        # 
+        typed_data = {
+            "types": types,
+            "domain": domain,
+            "primaryType": "PermitSingle",
+            "message": message,
+        }
+
+        signable = encode_typed_data(full_message=typed_data)
+        signed = Account.sign_message(signable, self.net.private_key)
+        v,r,s=signed.v,signed.r,signed.s
+
+        if isinstance(r, int):
+            r = r.to_bytes(32, byteorder='big')
+        if isinstance(s, int):
+            s = s.to_bytes(32, byteorder='big')
+
+        return v, r, s
+    #
+    #
+    def encode_permit2(self, token, amount, expiration, nonce, spender, sig_deadline, v, r, s):
+        # 
+        expiration = expiration & ((1 << 48) - 1)
+        nonce = nonce & ((1 << 48) - 1)
+        
+        #
+        r_bytes = r.to_bytes(32, 'big') if isinstance(r, int) else r
+        s_bytes = s.to_bytes(32, 'big') if isinstance(s, int) else s
+        v_byte = bytes([v])
+
+        #
+        encoded_struct = encode(
+            ["address", "uint160", "uint48", "uint48", "address", "uint256"],
+            [token, amount, expiration, nonce, spender, sig_deadline]
+        )
+        
+        return encoded_struct + r_bytes + s_bytes + v_byte
+    #
+    #
+    def encode_permit2_transfer_from(
+        self,
+        token: str,
+        from_addr: str,
+        to_addr: str,
+        amount: int
+    ):
+        return encode(
+            ["address", "address", "address", "uint160"],
+            [token, from_addr, to_addr, amount]
+        )
+    #
+    #
+    def build_pool_key(self,token0: str, token1: str, fee: int, tickspacing: int=None, hooks: str = "0x0000000000000000000000000000000000000000"):
+        if tickspacing is None:
+            tickspacing = calculate_tickspacing_by_feetier(fee)
+        t0 = self.net.to_checksum_address(token0)
+        t1 = self.net.to_checksum_address(token1)
+        
+        # V4 Requirement: token0 must be < token1
+        if int(t0, 16) > int(t1, 16):
+            t0, t1 = t1, t0
+            
+        return (t0, t1, int(fee), int(tickspacing), self.net.to_checksum_address(hooks))
+    #
+    #
+    def swap_exact_in_v4(self, token_in: Token, token_out: Token, amount_in: int, min_out: int, owner: str, fee: int, deadline: int = None):
+        self.commands = bytearray()
+        self.inputs = []
+
+        if deadline is None:
+            deadline = int(time.time()) + 300
+
+        is_native = token_in.is_native
+        tx_value = amount_in if is_native else 0
+        ADDRESS_ZERO = "0x0000000000000000000000000000000000000000"
+
+        # --- 1. FUNDING (Permit2 for ERC20) ---
+        # If the input is an ERC20, pull tokens from the user to this contract via Permit2
+        if not is_native:
+            transfer_cmd = self.encode_permit2_transfer_from(
+                token_in.address, owner, self.address, amount_in
+            )
+            self.commands.append(self.PERMIT2_TRANSFER_FROM)
+            self.inputs.append(transfer_cmd)
+
+        # --- 2. V4 POOL PREPARATION ---
+        pool_key = self.build_pool_key(token_in.address, token_out.address, fee)
+        zero_for_one = (token_in.address.lower() == pool_key[0].lower())
+        
+        # --- 3. CONSTRUCT NESTED V4 ACTIONS ---
+        # Standard V4Router OpCodes
+
+        v4_actions = bytearray()
+        v4_params = []
+
+        # Action A: SWAP (0x06)
+        v4_actions.append(self.ACTION_SWAP_EXACT_IN_SINGLE)
+        swap_params = encode(
+            ["(address,address,uint24,int24,address)", "bool", "uint128", "uint128", "bytes"],
+            [pool_key, zero_for_one, amount_in, min_out, b'']
+        )
+        v4_params.append(swap_params)
+
+        # Action B: SETTLE (0x0b)
+        # Clear the debit created by the swap for the input token
+        v4_actions.append(self.ACTION_SETTLE_NATIVE)
+        if is_native:
+            # For Native ETH, payerIsUser is False (Router pays PoolManager using msg.value)
+            settle_params = encode(
+                ["address", "uint256", "bool"], 
+                [ADDRESS_ZERO, amount_in, False]
+            )
+        else:
+            # For ERC20, amount 0 tells the router to use the full balance pulled via Permit2
+            settle_params = encode(
+                ["address", "uint256", "bool"], 
+                [token_in.address, 0, False]
+            )
+        v4_params.append(settle_params)
+
+        # Action C: TAKE_ALL (0x0f)
+        # Withdraw all bought tokens and send them to the owner
+        v4_actions.append(self.ACTION_TAKE_ALL)
+        # Params: Output token address and minimum amount expected (Slippage check)
+        take_params = encode(
+            ["address", "uint256"], 
+            [token_out.address, min_out]
+        )
+        v4_params.append(take_params)
+
+        # --- 4. PACKAGE V4 DATA ---
+        # Combine the byte array of actions and the array of encoded parameters
+        v4_encoded_input = encode(["bytes", "bytes[]"], [bytes(v4_actions), v4_params])
+
+        # Universal Router command for V4_SWAP is 0x10
+        self.commands.append(0x10) 
+        self.inputs.append(v4_encoded_input)
+
+        # --- 5. EXECUTION ---
+        return self.execute(
+            bytes(self.commands),
+            self.inputs,
+            deadline,
+            value=tx_value
+        )
+    #
+    #
+    def swap_exact_in_v4_2(self, token_in: Token, token_out: Token, amount_in: int, min_out: int, owner: str, fee: int, deadline: int = None):
+        self.commands = bytearray()
+        self.inputs = []
+
+        if deadline is None:
+            deadline = int(time.time()) + 300
+
+        is_native_in = token_in.is_native
+        is_native_out = token_out.is_native
+        
+        # msg.value should only be amount_in if we are sending ETH
+        tx_value = amount_in if is_native_in else 0
+        ADDRESS_ZERO = "0x0000000000000000000000000000000000000000"
+
+        # --- 1. FUNDING ---
+        # If input is ERC20, pull tokens from user via Permit2
+        if not is_native_in:
+            transfer_cmd = self.encode_permit2_transfer_from(
+                token_in.address, owner, self.address, amount_in
+            )
+            self.commands.append(self.PERMIT2_TRANSFER_FROM) # 0x03
+            self.inputs.append(transfer_cmd)
+
+        # --- 2. V4 POOL PREPARATION ---
+        pool_key = self.build_pool_key(token_in.address, token_out.address, fee)
+        zero_for_one = (token_in.address.lower() == pool_key[0].lower())
+        
+        # --- 3. CONSTRUCT NESTED V4 ACTIONS ---
+        ACTION_SWAP_EXACT_IN_SINGLE = 0x06
+        ACTION_SETTLE = 0x0b 
+        ACTION_TAKE_ALL = 0x0f
+
+        v4_actions = bytearray()
+        v4_params = []
+
+        # Action A: SWAP
+        v4_actions.append(ACTION_SWAP_EXACT_IN_SINGLE)
+        swap_params = encode(
+            ["(address,address,uint24,int24,address)", "bool", "uint128", "uint128", "bytes"],
+            [pool_key, zero_for_one, amount_in, min_out, b'']
+        )
+        v4_params.append(swap_params)
+
+        # Action B: SETTLE (Paying the pool)
+        v4_actions.append(ACTION_SETTLE)
+        if is_native_in:
+            # PayerIsUser=False: Router uses msg.value
+            settle_params = encode(["address", "uint256", "bool"], [ADDRESS_ZERO, amount_in, False])
+        else:
+            # PayerIsUser=False: Router uses tokens pulled to its balance via Permit2
+            settle_params = encode(["address", "uint256", "bool"], [token_in.address, 0, False])
+        v4_params.append(settle_params)
+
+        # Action C: TAKE_ALL (Receiving from the pool)
+        v4_actions.append(ACTION_TAKE_ALL)
+        if is_native_out:
+            # To receive Native ETH, we MUST use ADDRESS_ZERO
+            take_params = encode(["address", "uint256"], [ADDRESS_ZERO, min_out])
+        else:
+            take_params = encode(["address", "uint256"], [token_out.address, min_out])
+        v4_params.append(take_params)
+
+        # --- 4. PACKAGE V4 DATA ---
+        v4_encoded_input = encode(["bytes", "bytes[]"], [bytes(v4_actions), v4_params])
+        self.commands.append(0x10) # V4_SWAP
+        self.inputs.append(v4_encoded_input)
+
+        # --- 5. EXECUTION ---
+        return self.execute(
+            bytes(self.commands),
+            self.inputs,
+            deadline,
+            value=tx_value
+        )
+    #
+    #
+    def swap_exact_in_v4_3(self, token_in: Token, token_out: Token, amount_in: int, min_out: int, owner: str, fee: int, deadline: int = None):
+        self.commands = bytearray()
+        self.inputs = []
+
+        if deadline is None:
+            deadline = int(time.time()) + 300
+
+        is_native_in = token_in.is_native
+        is_native_out = token_out.is_native
+        
+        # Value is only sent if the input is Native ETH
+        tx_value = amount_in if is_native_in else 0
+        ADDRESS_ZERO = "0x0000000000000000000000000000000000000000"
+
+        # --- 1. FUNDING ---
+        if not is_native_in:
+            # Command 0x03: PERMIT2_TRANSFER_FROM
+            transfer_cmd = self.encode_permit2_transfer_from(
+                token_in.address, owner, self.address, amount_in
+            )
+            self.commands.append(0x03)
+            self.inputs.append(transfer_cmd)
+
+        # --- 2. V4 POOL PREPARATION ---
+        pool_key = self.build_pool_key(token_in.address, token_out.address, fee)
+        zero_for_one = (token_in.address.lower() == pool_key[0].lower())
+        
+        # --- 3. CONSTRUCT NESTED V4 ACTIONS ---
+        ACTION_SWAP_EXACT_IN_SINGLE = 0x06
+        ACTION_SETTLE = 0x0b 
+        ACTION_TAKE_ALL = 0x0f
+
+        v4_actions = bytearray()
+        v4_params = []
+
+        # Action A: SWAP
+        # Note: V4 SWAP_EXACT_IN_SINGLE expects: (PoolKey, zeroForOne, amountIn, amountOutMinimum, hookData)
+        v4_actions.append(ACTION_SWAP_EXACT_IN_SINGLE)
+        swap_params = encode(
+            ["(address,address,uint24,int24,address)", "bool", "uint128", "uint128", "bytes"],
+            [pool_key, zero_for_one, amount_in, min_out, b'']
+        )
+        v4_params.append(swap_params)
+
+        # Action B: SETTLE
+        v4_actions.append(ACTION_SETTLE)
+        if is_native_in:
+            # Currency, Amount, PayerIsUser
+            settle_params = encode(["address", "uint256", "bool"], [ADDRESS_ZERO, amount_in, False])
+        else:
+            # Currency, Amount (0 = all), PayerIsUser
+            settle_params = encode(["address", "uint256", "bool"], [token_in.address, 0, False])
+        v4_params.append(settle_params)
+
+        # Action C: TAKE_ALL
+        v4_actions.append(ACTION_TAKE_ALL)
+        # Currency, minAmount
+        out_currency = ADDRESS_ZERO if is_native_out else token_out.address
+        take_params = encode(["address", "uint256"], [out_currency, min_out])
+        v4_params.append(take_params)
+
+        # --- 4. PACKAGE V4 DATA (CRITICAL STEP) ---
+        # The Universal Router command 0x10 expects a single bytes blob 
+        # which is the encoding of (bytes actions, bytes[] params)
+        v4_encoded_input = encode(["bytes", "bytes[]"], [bytes(v4_actions), v4_params])
+
+        self.commands.append(0x10) # V4_SWAP
+        self.inputs.append(v4_encoded_input)
+
+        # --- 5. EXECUTION ---
+        return self.execute(
+            bytes(self.commands),
+            self.inputs,
+            deadline,
+            value=tx_value
+        )
+    #
+    #
+    def swap_exact_in_v4_4(self, token_in: Token, token_out: Token, amount_in: int, min_out: int, owner: str, fee: int, deadline: int = None):
+        self.commands = bytearray()
+        self.inputs = []
+
+        if deadline is None:
+            deadline = int(time.time()) + 300
+
+        is_native_in = token_in.is_native
+        is_native_out = token_out.is_native
+        tx_value = amount_in if is_native_in else 0
+        ADDRESS_ZERO = "0x0000000000000000000000000000000000000000"
+
+        # --- 1. FUNDING ---
+        if not is_native_in:
+            # Command 0x03: PERMIT2_TRANSFER_FROM
+            transfer_cmd = self.encode_permit2_transfer_from(
+                token_in.address, owner, self.address, amount_in
+            )
+            self.commands.append(0x03)
+            self.inputs.append(transfer_cmd)
+
+        # --- 2. V4 POOL PREPARATION ---
+        pool_key = self.build_pool_key(token_in.address, token_out.address, fee)
+        zero_for_one = (token_in.address.lower() == pool_key[0].lower())
+        
+        # --- 3. CONSTRUCT NESTED V4 ACTIONS ---
+        ACTION_SWAP_EXACT_IN_SINGLE = 0x06
+        ACTION_SETTLE = 0x0b 
+        ACTION_TAKE_ALL = 0x0f
+
+        v4_actions = bytearray()
+        v4_params = []
+
+        # Action A: SWAP
+        v4_actions.append(ACTION_SWAP_EXACT_IN_SINGLE)
+        v4_params.append(encode(
+            ["(address,address,uint24,int24,address)", "bool", "uint128", "uint128", "bytes"],
+            [pool_key, zero_for_one, amount_in, min_out, b'']
+        ))
+
+        # Action B: SETTLE
+        v4_actions.append(ACTION_SETTLE)
+        currency_in = ADDRESS_ZERO if is_native_in else token_in.address
+        # For ERC20 sell: amount=0 (full balance), payerIsUser=False (already in router)
+        v4_params.append(encode(["address", "uint256", "bool"], [currency_in, 0 if not is_native_in else amount_in, False]))
+
+        # Action C: TAKE_ALL
+        v4_actions.append(ACTION_TAKE_ALL)
+        currency_out = ADDRESS_ZERO if is_native_out else token_out.address
+        v4_params.append(encode(["address", "uint256"], [currency_out, min_out]))
+
+        # --- 4. PACKAGE V4 DATA (THE FIX) ---
+        # Universal Router expects V4_SWAP input to be: 
+        # abi.encode(actions, params) -> where actions is bytes and params is bytes[]
+        v4_nested_input = encode(["bytes", "bytes[]"], [bytes(v4_actions), v4_params])
+
+        self.commands.append(0x10) # V4_SWAP
+        self.inputs.append(v4_nested_input)
+
+        # --- 5. EXECUTION ---
+        # Ensure commands is a bytes object
+        return self.execute(
+            bytes(self.commands),
+            self.inputs,
+            deadline,
+            value=tx_value
+        )
+    #
+    #
+    def swap_exact_in_v4_5(self, token_in: Token, token_out: Token, amount_in: int, min_out: int, owner: str, fee: int, deadline: int = None):
+        self.commands = bytearray()
+        self.inputs = []
+
+        if deadline is None:
+            deadline = int(time.time()) + 300
+
+        is_native_in = token_in.is_native
+        is_native_out = token_out.is_native
+        tx_value = amount_in if is_native_in else 0
+        ADDRESS_ZERO = "0x0000000000000000000000000000000000000000"
+
+        # --- Universal Router Top-Level Commands ---
+        CMD_PERMIT2_TRANSFER_FROM = 0x03
+        CMD_V4_SWAP = 0x10
+        CMD_SWEEP = 0x04
+
+        # --- V4 Router Nested Actions ---
+        ACTION_SWAP_EXACT_IN_SINGLE = 0x06
+        ACTION_SETTLE = 0x0b 
+        ACTION_TAKE_ALL = 0x0f # Using 0x0f (Standard Encode) instead of 0x0c (Packed)
+
+        # ---------------------------------------------------------
+        # 1. FUNDING (Input)
+        # ---------------------------------------------------------
+        if not is_native_in:
+            # FIX from Code 5: Use 3 arguments for Command 0x03 (token, recipient, amount)
+            # This pulls tokens from User -> UniversalRouter
+            transfer_cmd = encode(
+                ["address", "address", "uint256"],
+                [token_in.address, self.address, amount_in]
+            )
+            self.commands.append(CMD_PERMIT2_TRANSFER_FROM)
+            self.inputs.append(transfer_cmd)
+
+        # ---------------------------------------------------------
+        # 2. V4 ACTIONS (Nested in Command 0x10)
+        # ---------------------------------------------------------
+        v4_actions = bytearray()
+        v4_params = []
+        
+        # Prepare Pool Key
+        pool_key = self.build_pool_key(token_in.address, token_out.address, fee)
+        zero_for_one = (token_in.address.lower() == pool_key[0].lower())
+
+        # Action A: SWAP (0x06)
+        v4_actions.append(ACTION_SWAP_EXACT_IN_SINGLE)
+        swap_params = encode(
+            ["(address,address,uint24,int24,address)", "bool", "uint128", "uint128", "bytes"],
+            [pool_key, zero_for_one, amount_in, min_out, b'']
+        )
+        v4_params.append(swap_params)
+
+        # Action B: SETTLE (0x0b)
+        # Settle debt with PoolManager.
+        # Standard ABI Encode (3 params).
+        v4_actions.append(ACTION_SETTLE)
+        if is_native_in:
+            # Native: payerIsUser=False (Router pays from msg.value)
+            settle_params = encode(["address", "uint256", "bool"], [ADDRESS_ZERO, amount_in, False])
+        else:
+            # Token: payerIsUser=False (Router pays from balance pulled via Permit2)
+            # amount=0 implies "use full balance recorded in delta"
+            settle_params = encode(["address", "uint256", "bool"], [token_in.address, 0, False])
+        v4_params.append(settle_params)
+
+        # Action C: TAKE_ALL (0x0f)
+        # Claim output from PoolManager to UniversalRouter.
+        # Using 0x0f (TAKE_ALL) allows Standard ABI Encoding (Safer than 0x0c Packed).
+        v4_actions.append(ACTION_TAKE_ALL)
+        currency_out = ADDRESS_ZERO if is_native_out else token_out.address
+        take_params = encode(["address", "uint256"], [currency_out, min_out])
+        v4_params.append(take_params)
+
+        # Wrap V4 Actions
+        v4_encoded_input = encode(["bytes", "bytes[]"], [bytes(v4_actions), v4_params])
+        self.commands.append(CMD_V4_SWAP)
+        self.inputs.append(v4_encoded_input)
+
+        # ---------------------------------------------------------
+        # 3. SWEEP (Output)
+        # ---------------------------------------------------------
+        # TAKE_ALL moved funds to the Router. Now we must sweep them to the User.
+        # This handles both ERC20 and Native ETH output.
+        sweep_token = ADDRESS_ZERO if is_native_out else token_out.address
+        sweep_cmd = encode(
+            ["address", "address", "uint256"],
+            [sweep_token, owner, min_out]
+        )
+        self.commands.append(CMD_SWEEP)
+        self.inputs.append(sweep_cmd)
+
+        # ---------------------------------------------------------
+        # 4. EXECUTION
+        # ---------------------------------------------------------
+        return self.execute(
+            bytes(self.commands),
+            self.inputs,
+            deadline,
+            value=tx_value
+        )
+    #
+    #
+    def swap_exact_in5(self, token_in: Token, token_out: Token, amount_in: int, min_out: int, owner: str, fee: int, deadline: int = None):
+        self.commands = bytearray()
+        self.inputs = []
+
+        if deadline is None:
+            deadline = int(time.time()) + 300
+
+        is_native = token_in.is_native
+        tx_value = amount_in if is_native else 0
+        ADDRESS_ZERO = "0x0000000000000000000000000000000000000000"
+
+        # --- 1. FUNDING (Permit2 for ERC20) ---
+        if not is_native:
+            transfer_cmd = self.encode_permit2_transfer_from(
+                token_in.address, owner, self.address, amount_in
+            )
+            self.commands.append(self.PERMIT2_TRANSFER_FROM)
+            self.inputs.append(transfer_cmd)
+
+        # --- 2. V4 POOL PREPARATION ---
+        pool_key = self.build_pool_key(token_in.address, token_out.address, fee)
+        zero_for_one = (token_in.address.lower() == pool_key[0].lower())
+        
+        # --- 3. CONSTRUCT NESTED V4 ACTIONS ---
+        # OpCodes استاندارد V4Router
+        ACTION_SWAP_EXACT_IN_SINGLE = 0x06
+        ACTION_SETTLE = 0x0b      # تسویه ورودی
+        ACTION_TAKE_ALL = 0x0f    # برداشت تمام خروجی (بسیار امن‌تر از TAKE)
+
+        v4_actions = bytearray()
+        v4_params = []
+
+        # Action A: SWAP (0x06)
+        v4_actions.append(ACTION_SWAP_EXACT_IN_SINGLE)
+        swap_params = encode(
+            ["(address,address,uint24,int24,address)", "bool", "uint128", "uint128", "bytes"],
+            [pool_key, zero_for_one, amount_in, min_out, b'']
+        )
+        v4_params.append(swap_params)
+
+        # Action B: SETTLE (0x0b)
+        # تسویه کردن مبلغ ورودی با استخر
+        v4_actions.append(ACTION_SETTLE)
+        if is_native:
+            # برای ETH مقدار payerIsUser باید False باشد چون روتر از msg.value پرداخت می‌کند
+            settle_params = encode(
+                ["address", "uint256", "bool"], 
+                [ADDRESS_ZERO, amount_in, False]
+            )
+        else:
+            # برای ERC20 مقدار 0 به معنی کل موجودی است که روتر از کاربر کشیده است
+            settle_params = encode(
+                ["address", "uint256", "bool"], 
+                [token_in.address, 0, False]
+            )
+        v4_params.append(settle_params)
+
+        # Action C: TAKE_ALL (0x0f)
+        # برداشت تمام توکن‌های خریداری شده و ارسال به کاربر
+        v4_actions.append(ACTION_TAKE_ALL)
+        # پارامترها: آدرس توکن خروجی و حداقل مقدار مورد انتظار (Slippage check)
+        take_params = encode(
+            ["address", "uint256"], 
+            [token_out.address, min_out]
+        )
+        v4_params.append(take_params)
+
+        # --- 4. PACKAGE V4 DATA ---
+        v4_encoded_input = encode(["bytes", "bytes[]"], [bytes(v4_actions), v4_params])
+
+        # Universal Router command for V4_SWAP is 0x10
+        self.commands.append(0x10) 
+        self.inputs.append(v4_encoded_input)
+
+        # --- 5. EXECUTION ---
+        return self.execute(
+            bytes(self.commands),
+            self.inputs,
+            deadline,
+            value=tx_value
+        )
+    #
+    #
+
+    def get_permit2_domain(self):
+        return {
+            "name": "Permit2",
+            "chainId": self.net.chain_id,
+            "verifyingContract": self.net.permit2_address
+        }
+    #
+    #
+    def encode_settle_pair(self, currency0: str, currency1: str):
+        return encode(
+            ["address", "address"],
+            [currency0, currency1]
+        )
+    #
+    #
+    def encode_v4_settle(self, currency: str, amount: int, payer_is_user: bool):
+        return encode(
+            ["address", "uint256", "bool"],
+            [currency, amount, payer_is_user]
+        )
+    #
+    #
+    def encode_v4_take(self, currency: str, recipient: str, amount: int):
+        return encode(
+            ["address", "address", "uint256"],
+            [currency, recipient, amount]
+        )
+    #
+    #
+#
+#
+#
 class LPPosition(BaseEntity):
-    def __init__(self, net: Web3_Network,abi_reg:ABIRegistry ,token_id: int):
+    def __init__(self, net: Web3_Network,abi_reg:ABIRegistry ,token_id: int,metadata=None):
         super().__init__(net)
         self.abi_reg = abi_reg
         self.token_id = token_id
+        self.metadata=metadata
+
+        if metadata:
+            self.liquidity = metadata.get('liquidity')
+            self.tick_lower = metadata.get('tickLower')
+            self.tick_upper = metadata.get('tickUpper')
+            self.amount0_init = metadata.get('amount0')
+            self.amount1_init = metadata.get('amount1')
+            
+        else:
+            self.tick_lower: int | None = None
+            self.tick_upper: int | None = None
+            self.liquidity: int | None = None
+
 
         self.token0: str | None = None
         self.token1: str | None = None
         self.fee: int | None = None
-
-        self.tick_lower: int | None = None
-        self.tick_upper: int | None = None
-        self.liquidity: int | None = None
-
         self.tokens_fee0: int | None = None
         self.tokens_fee1: int | None = None
+
         self.load()
 
     def load(self, pm_address: str=None):
@@ -1660,15 +3249,26 @@ class LPPosition(BaseEntity):
         pos = nfpm_contract.functions.positions(
             self.token_id
         ).call()
+        if self.metadata and self.tick_lower == pos[5] and self.tick_upper == pos[6] and self.liquidity== pos[7]:
+            self.token0 = pos[2]
+            self.token1 = pos[3]
+            self.fee = pos[4]
+            self.tokens_fee0 = pos[10]
+            self.tokens_fee1 = pos[11]
+        else:
+            if self.metadata is None:
+                print('None MetaData')
+            elif self.tick_lower != pos[5] or self.tick_upper != pos[6] or self.liquidity != pos[7]:
+                print('Mismatching MetaData and onchain data')
 
-        self.token0 = pos[2]
-        self.token1 = pos[3]
-        self.fee = pos[4]
-        self.tick_lower = pos[5]
-        self.tick_upper = pos[6]
-        self.liquidity = pos[7]
-        self.tokens_fee0 = pos[10]
-        self.tokens_fee1 = pos[11]
+            self.token0 = pos[2]
+            self.token1 = pos[3]
+            self.fee = pos[4]
+            self.tick_lower = pos[5]
+            self.tick_upper = pos[6]
+            self.liquidity = pos[7]
+            self.tokens_fee0 = pos[10]
+            self.tokens_fee1 = pos[11]
 
     def is_in_range(self, current_tick: int) -> bool:
         return self.tick_lower <= current_tick <= self.tick_upper
@@ -1728,7 +3328,7 @@ class LPPosition(BaseEntity):
         pos = self.nfpm_contract.functions.positions(
             self.token_id
         ).call()
-
+  
         return {
             "token0": pos[2],
             "token1": pos[3],
@@ -1739,7 +3339,6 @@ class LPPosition(BaseEntity):
             "tokens_fee0": pos[10],
             "tokens_fee1": pos[11]
         }
-
 #
 #
 #
@@ -1782,7 +3381,7 @@ class PositionManager(BaseEntity):
                     
                     # Create and load an LPPosition object
                     # This object already contains the logic to fetch position details from the blockchain
-                    pos = LPPosition(self.net,self.abi_reg ,token_id)
+                    pos = LPPosition(self.net,self.abi_reg ,token_id,None)
                     pos.load(self.address) # self.address here is the Position Manager contract address
                     
                     positions_list.append(pos)
@@ -2096,17 +3695,25 @@ class PositionManager(BaseEntity):
         pool=V3Pool.from_factory(self.net, token0.address, token1.address, fee,self.abi_reg ,self.net.factory_address)
         pool.load()
         pool.update_state()
+        
         cp=calculate_raw_price_from_sqrt_price(pool.sqrtPriceX96)
         tick_lower, tick_upper = pool.get_current_match_tick_range(10,step=step)
         lp=calculate_raw_price_by_tick(tick_lower)
         up=calculate_raw_price_by_tick(tick_upper)
+        
         token0.load()
         token1.load()
         token0.balance_of()
         token1.balance_of()
         bal0=token0.token_balance
         bal1=token1.token_balance
+        
         res=calculate_required_amount_and_swap(cp,lp,up,bal0,bal1)
+        tick_after=pool.pool_state_after_swap_simple(res['swap_details'],res['swap_amount'])
+        if tick_after<tick_lower or tick_after>tick_upper:
+            raise RuntimeError("Tick out of range.")
+        if res['amount0_target']<1 or res['amount1_target']<1:
+            raise RuntimeError("Insufficient balance for JIT Zap minting.")
 
         router = SwapRouter(self.net,self.abi_reg ,self.net.router_address)
 
@@ -2139,6 +3746,1087 @@ class PositionManager(BaseEntity):
                                     tick_upper, token0.token_balance, token1.token_balance,amount0min,amount1min ,slippage, deadline)
     #
     #
+#
+#
+#
+class LPPositionV4:
+    def __init__(self, net, abi_registry, nft_id, manager_address=None,log_metadata=None):
+        self.net = net
+        self.nft_id = nft_id
+        self.abi_reg=abi_registry
+        self.log_metadat=log_metadata
+
+        if manager_address is None:
+            if not hasattr(net, "v4_positon_manager_address"):
+                raise RuntimeError("v4_positon_manager_address not loaded in network")
+            manager_address = net.v4_positon_manager_address
+
+        self.manager_address = manager_address
+        
+        # Loading V4 ABI from registry
+        self.abi = abi_registry.GET_V4_PM_ABI(manager_address)
+        self.contract = net.eth.contract(address=net.to_checksum_address(manager_address), abi=self.abi)
+        
+        # Extracting V4 Data via getPoolAndPositionInfo
+        # Returns: (PoolKey struct, PositionInfo uint256)
+
+
+        self.pool_data = self.contract.functions.getPoolAndPositionInfo(nft_id).call()
+        self.liquidity = self.contract.functions.getPositionLiquidity(nft_id).call()
+        self.position_info = self.pool_data[1]
+        if log_metadata:
+            self.tickLower = log_metadata.get('tickLower')
+            self.tickUpper = log_metadata.get('tickUpper')
+            self.salt = log_metadata.get('salt')
+            self.pool_id = log_metadata.get('poolId')
+            self.liquiditydelta=log_metadata.get('liquidityDelta')
+        else:
+            self.extract_ticks_from_uri()
+        
+        self.parse_pool_key()
+        
+    #
+    #
+    def parse_pool_key(self):
+        """Unpacks the PoolKey struct from V4"""
+        key = self.pool_data[0]
+        self.currency0 = key[0]
+        self.currency1 = key[1]
+        self.fee = key[2]
+        self.tickSpacing = key[3]
+        self.hooks = key[4]
+    #
+    #
+    def decode_token_uri(self,token_id: str):
+        token_uri = self.contract.functions.tokenURI(token_id).call()
+        assert token_uri.startswith("data:application/json;base64,")
+        b64 = token_uri.split(",")[1]
+        decoded = base64.b64decode(b64)
+        self.meta= json.loads(decoded)
+    #
+    #
+    def extract_position_from_uri(self,meta: Dict=None) -> Dict:
+        if meta is None:
+            self.decode_token_uri(self.nft_id)
+            meta = self.meta
+        
+        result = {}
+
+        # ---------- 1️⃣ name ----------
+        name = meta.get("name", "")
+        result["name"] = name
+
+        # fee tier
+        fee_match = re.search(r"([\d.]+)%", name)
+        result["fee_percent"] = float(fee_match.group(1)) if fee_match else None
+
+        # price range
+        price_match = re.search(r"([\d.]+)<>([\d.]+)", name)
+        if price_match:
+            result["price_lower"] = float(price_match.group(1))
+            result["price_upper"] = float(price_match.group(2))
+        else:
+            result["price_lower"] = result["price_upper"] = None
+
+        # ---------- 2️⃣ description ----------
+        desc = meta.get("description", "")
+
+        def extract_line(label):
+            m = re.search(rf"{label}:\s*(.+)", desc)
+            return m.group(1).strip() if m else None
+
+        result["pool_manager"] = extract_line("Pool Manager Address")
+        result["token0_address"] = extract_line("USDC Address")  # generic parse below
+        result["token1_address"] = extract_line("ETH Address")
+        result["hook"] = extract_line("Hook Address")
+        result["token_id"] = int(extract_line("Token ID"))
+
+        # ---------- 3️⃣ SVG decode ----------
+        image = meta.get("image", "")
+        if image.startswith("data:image/svg+xml;base64,"):
+            svg_b64 = image.split(",")[1]
+            svg = base64.b64decode(svg_b64).decode("utf-8")
+
+            # tick lower / upper
+            tick_matches = re.findall(r"(Min Tick|Max Tick):\s*(-?\d+)", svg)
+            for k, v in tick_matches:
+                if "Min" in k:
+                    result["tick_lower"] = int(v)
+                elif "Max" in k:
+                    result["tick_upper"] = int(v)
+        else:
+            result["tick_lower"] = result["tick_upper"] = None
+
+        # ---------- 4️⃣ fees (not in metadata) ----------
+        result["fees_owed_0"] = None
+        result["fees_owed_1"] = None
+        result["fees_source"] = "NOT_IN_METADATA"
+
+        return result
+    #
+    #
+    def extract_ticks_from_uri(self,meta=None):
+        if meta is None:
+            self.decode_token_uri(self.nft_id)
+            
+        image = self.meta.get("image", "")
+        if not image.startswith("data:image/svg+xml;base64,"):
+            return {"min_tick": None, "max_tick": None}
+
+        svg_b64 = image.split(",", 1)[1]
+        svg = base64.b64decode(svg_b64).decode("utf-8", errors="ignore")
+
+        patterns = [
+            r"Min\s*Tick[^-0-9]*(-?\d+)",
+            r"Max\s*Tick[^-0-9]*(-?\d+)",
+            r"Tick\s*Lower[^-0-9]*(-?\d+)",
+            r"Tick\s*Upper[^-0-9]*(-?\d+)",
+        ]
+
+        min_tick = None
+        max_tick = None
+
+        for p in patterns:
+            if "Min" in p or "Lower" in p:
+                m = re.search(p, svg, re.IGNORECASE)
+                if m:
+                    min_tick = int(m.group(1))
+            if "Max" in p or "Upper" in p:
+                m = re.search(p, svg, re.IGNORECASE)
+                if m:
+                    max_tick = int(m.group(1))
+
+        self.tickLower=min_tick
+        self.tickUpper=max_tick
+
+    #
+    #
+    def get_token(self):
+        print(f"Token0: {self.currency0}, Token1: {self.currency1}")
+        return Token(self.net, self.abi_reg, self.currency0), Token(self.net, self.abi_reg, self.currency1)
+    #
+    #
+    '''def is_in_range_extended(self):
+        v4_position_manager=V4PositionManager(self.net,self.abi_reg)
+        pool_manger=V4PoolManager(self.net,self.abi_reg,v4_position_manager)
+        pool_info=pool_manger.pool_current_info()
+        return self.tickLower<pool_info['currentTick']<self.tickUpper'''
+    #
+    #
+    def info(self):
+        pool_key=self.pool_data[0]
+        if not hasattr(self, "tickLower") or not hasattr(self, "tickUpper"): self.extract_ticks_from_metadata()
+        if not hasattr(self,'pool_id'):
+            return {
+            "nft_id": self.nft_id,
+            "liquidity": self.liquidity,
+            "tickLower": self.tickLower,
+            "tickUpper": self.tickUpper,
+            "token0": pool_key[0],
+            "token1": pool_key[1],
+            "fee": pool_key[2],
+            "tickSpacing": pool_key[3]}
+        else:
+            return {
+                "nft_id": self.nft_id,
+                "liquidity": self.liquidity,
+                "tickLower": self.tickLower,
+                "tickUpper": self.tickUpper,
+                "token0": pool_key[0],
+                "token1": pool_key[1],
+                "fee": pool_key[2],
+                "tickSpacing": pool_key[3],
+                "hooks": pool_key[4],
+                "pool_id":self.pool_id if self.pool_id else None,
+                "salt":self.salt if self.salt else None
+            }
+#
+#
+#
+class V4PositionManager:
+    def __init__(self, net, abi_reg, v4_pm_address=None):
+        if v4_pm_address is None:
+            if not hasattr(net, "v4_position_manager_address"):
+                raise RuntimeError("v4_position_manager_address not loaded in network")
+            self.address = net.v4_position_manager_address
+        else:
+            self.address = v4_pm_address
+            
+        self.net = net
+        self.w3= net.eth
+        self.abi_reg=abi_reg
+        self.all_v4_positions=[]
+        
+        # Load ABI
+        abi=self.abi_reg.GET_V4_PM_ABI(self.address)
+        self.contract = self.w3.contract(
+            address=net.to_checksum_address(self.address),
+            abi=abi
+        )
+        
+        # Action Constants (Uniswap v4 Standard)
+        self.MINT_POSITION      = 0x02
+        self.MODIFY_LIQUIDITY   = 0x0D
+        self.BURN_POSITION      = 0x0E
+        self.COLLECT_FEES       = 0x10
+        self.SETTLE_PAIR        = 0x14
+        self.SWAP                = 0x15
+        self.PERMIT             = 0x23
+    #
+    #
+    def extract_action_constants(self):
+        """
+        Scan the ABI cache for constants representing V4 actions
+        and return a dictionary mapping action names to their numeric values.
+        """
+        constants = {}
+        
+        # ABI registry assumed to have a method returning full ABI for PM
+        abi = self.abi_reg.GET_V4_PM_ABI(self.address)
+        
+        for item in abi:
+            # We're looking for entries of type 'function' with constant outputs
+            if item.get("type") == "function" and item.get("constant"):
+                name = item.get("name")
+                # Try to call the function to get its value
+                try:
+                    value = getattr(self.contract.functions, name)().call()
+                    constants[name] = value
+                except Exception:
+                    continue
+        
+        return constants
+
+    # ---------- HELPER: POOL KEY BUILDER ----------
+    #
+    def build_pool_key(self, tokenA: str, tokenB: str, fee: int, tick_spacing: int, hooks: str = "0x0000000000000000000000000000000000000000") -> tuple:
+        """
+        Sorts tokens and returns the PoolKey tuple required for encoding.
+        """
+        t0 = self.net.to_checksum_address(tokenA)
+        t1 = self.net.to_checksum_address(tokenB)
+        
+        # V4 Requirement: token0 must be < token1
+        if int(t0, 16) > int(t1, 16):
+            t0, t1 = t1, t0
+            
+        return (t0, t1, int(fee), int(tick_spacing), self.net.to_checksum_address(hooks))
+    #
+    # ---------- ENCODING HELPERS ----------
+    #
+    def encode_mint_burn(self, owner: str, salt: int) -> bytes:
+        return encode(["address", "uint256"], [owner, salt])
+    #
+    #
+    def encode_modify_liquidity(self, pool_key: tuple, tick_lower: int, tick_upper: int, liquidity_delta: int, salt: bytes = b'\x00'*32) -> bytes:
+        """
+        Encodes parameters matching the V4 ABI structure.
+        The first argument in ABI is the PoolKey struct.
+        """
+        return encode(
+            # Signature: (PoolKeyStruct, tickLower, tickUpper, liquidityDelta, salt)
+            ["(address,address,uint24,int24,address)", "int24", "int24", "int256", "bytes32"],
+            [pool_key, tick_lower, tick_upper, liquidity_delta, salt]
+        )
+    #
+    #
+    def encode_collect_fees(self, pool_key: tuple, tick_lower: int, tick_upper: int, recipient: str, salt: int) -> bytes:
+        return encode(
+            ["(address,address,uint24,int24,address)", "int24", "int24", "address", "uint256"],
+            [pool_key, tick_lower, tick_upper, recipient, salt]
+        )
+    #
+    #
+    def encode_settle_pair(self, currency0: str, currency1: str) -> bytes:
+        return encode(["address", "address"], [currency0, currency1])
+    #
+    #
+    def _encode_unlock(self, actions: bytes, params: list[bytes]) -> bytes:
+        return encode(["bytes", "bytes[]"], [actions, params])
+    #
+    #
+    def encode_swap_native_to_token(
+        self,
+        token_out: str,
+        amount_in: int,
+        min_amount_out: int,
+        pool_key: tuple,
+        owner: str
+    ) -> bytes:
+        """
+        Encode Native -> ERC20 swap for V4 multicall
+        """
+        fn = self.contract.get_function_by_name("swapNativeToERC20")
+        tx = fn(token_out, amount_in, min_amount_out, pool_key).buildTransaction({
+            'from': owner
+        })
+        return tx['data'].encode()
+    #
+    #
+    def encode_swap_erc20_to_erc20(
+        self,
+        token_in: str,
+        token_out: str,
+        amount_in: int,
+        min_amount_out: int,
+        pool_key: tuple,
+        owner: str
+    ) -> bytes:
+        fn = self.contract.get_function_by_name("swapERC20ToERC20")
+        tx = fn(token_in, token_out, amount_in, min_amount_out, pool_key).buildTransaction({
+            'from': owner
+        })
+        return tx['data'].encode()
+    #
+    #
+    def encode_permit(self, token, owner, spender, amount, salt, deadline) -> bytes:
+        token = self.net.to_checksum_address(token)
+        owner = self.net.to_checksum_address(owner)
+        spender = self.net.to_checksum_address(spender)
+
+        fn = self.contract.get_function_by_name("permit")(owner, spender, amount, deadline, salt)
+        return fn._encode_transaction_data()
+    #
+    #
+    def encode_permit_with_vrs(
+        self,
+        token: str,
+        owner: str,
+        spender: str,
+        value: int,
+        deadline: int,
+        v: int,
+        r: bytes,
+        s: bytes
+    ) -> bytes:
+        """
+        Encode EIP-2612 permit (v,r,s) for multicall in V4PositionManager.
+
+        Args:
+            token: address of ERC20 token
+            owner: token owner
+            spender: approved spender
+            value: allowance amount
+            deadline: permit expiry timestamp
+            v, r, s: signature components
+
+        Returns:
+            bytes: calldata ready for multicall
+        """
+        token = self.net.to_checksum_address(token)
+        owner = self.net.to_checksum_address(owner)
+        spender = self.net.to_checksum_address(spender)
+
+        # گرفتن تابع permit از ABI
+        fn = self.contract.get_function_by_name("permit")(
+            owner, spender, value, deadline, v, r, s
+        )
+
+        # خروجی bytes
+        return fn._encode_transaction_data()
+
+    #
+    # ---------- BUILDERS ----------
+    #
+    def build_mint_liquidity(self, owner, pool_key, tick_lower, tick_upper, liquidity, salt_uint):
+        # Ensure salt is bytes32 for modify_liquidity but uint256 for mint tracking if needed
+        # Usually salt is passed as bytes32 in modifyLiquidity params
+        salt_bytes = salt_uint.to_bytes(32, 'big')
+
+        actions = bytes([
+            self.MINT_POSITION,
+            self.MODIFY_LIQUIDITY,
+            self.SETTLE_PAIR
+        ])
+
+        params = [
+            self.encode_mint_burn(owner, salt_uint),
+            self.encode_modify_liquidity(pool_key, tick_lower, tick_upper, liquidity, salt_bytes),
+            self.encode_settle_pair(pool_key[0], pool_key[1])
+        ]
+
+        return actions, params
+    #
+    #
+    def build_collect_and_burn(self, owner, pool_key, tick_lower, tick_upper, liquidity, salt_uint):
+        salt_bytes = salt_uint.to_bytes(32, 'big')
+        
+        actions = bytes([
+            self.COLLECT_FEES,
+            self.MODIFY_LIQUIDITY,
+            self.BURN_POSITION,
+            self.SETTLE_PAIR
+        ])
+
+        params = [
+            self.encode_collect_fees(pool_key, tick_lower, tick_upper, owner, salt_uint),
+            # liquidity_delta must be negative for burning
+            self.encode_modify_liquidity(pool_key, tick_lower, tick_upper, -liquidity, salt_bytes),
+            self.encode_mint_burn(owner, salt_uint),
+            self.encode_settle_pair(pool_key[0], pool_key[1])
+        ]
+
+        return actions, params
+    #
+    # ---------- CORE FUNCTIONS ----------
+    #
+    def modify_liquidities(self, actions: bytes, params: list[bytes], deadline: int):
+        """
+        Directly calls modifyLiquidities (useful if not using ETH/Multicall)
+        """
+        unlock_data = self._encode_unlock(actions, params)
+        return self.contract.functions.modifyLiquidities(
+            unlock_data,
+            deadline
+        )
+    #
+    #
+    def build_multicall_liquidity_transaction(
+        self,
+        actions: bytes,
+        params: list[bytes],
+        deadline: int
+    ):
+        """
+        Builds multicall(bytes[]) containing modifyLiquidities calldata.
+        """
+
+        unlock_data = self._encode_unlock(actions, params)
+
+        modify_data = self.contract.functions.modifyLiquidities(
+            unlock_data,
+            deadline
+        ).build_transaction({"gas": 0})["data"]
+
+        calls = [self.net.to_bytes(hexstr=modify_data)]
+
+        return self.contract.functions.multicall(calls)
+    #
+    #
+    def initialize_pool(self, pool_key: tuple, sqrt_price_x96: int):
+        return self.contract.functions.initializePool(
+            pool_key,
+            sqrt_price_x96
+        )
+    #
+    # ---------- UTILS ----------
+    #
+    @staticmethod
+    def make_salt(owner, pool_key, tick_lower, tick_upper, strategy_id=1):
+        """
+        Generates a deterministic salt compatible with Solidity keccak256
+        """
+        # Packing types must match the data types
+        # PoolKey is a struct: (address, address, uint24, int24, address)
+        types = ["address", "(address,address,uint24,int24,address)", "int24", "int24", "uint256"]
+        values = [owner, pool_key, tick_lower, tick_upper, strategy_id]
+        
+        encoded = encode(types, values)
+        return int(Web3.keccak(encoded).hex(), 16)
+    #------------------------------------------------------------------------------------------------------
+    #
+    def get_pool_id(self, token0=Token, token1=Token, fee=0, tick_spacing:int=None,         hook_address:str="0x0000000000000000000000000000000000000000"):
+            if tick_spacing is None:
+                tick_spacing = calculate_tickspacing_by_feetier(fee)
+            pool_key = (token0.address, token1.address, fee, tick_spacing, hook_address)
+            pool_id = self.net.keccak(
+            encode(
+                ["address","address","uint24","int24","address"],
+                pool_key
+            )
+            )
+            return pool_id
+    #
+    #
+    def get_all_position(self):
+        next_token_id=self.contract.functions.nextTokenId().call()
+        #print(next_token_id)
+        for i in tqdm(range(int(0.993*next_token_id),next_token_id)):
+            if self.contract.functions.ownerOf(i).call().lower()==self.net.address.lower():
+                #print(i)
+                v4_lp=LPPositionV4(self.net,self.abi_reg,i,self.address)
+                if v4_lp.liquidity>0:
+                    self.all_v4_positions.append(v4_lp)
+                time.sleep(0.2)
+        print(f"Founding {len(self.all_v4_positions)} Active V4 Positions ")
+    #
+    #
+    def mint(self,token0: Token, token1: Token, fee: int, tick_lower: int, tick_upper: int, amount0_desired: int, amount1_desired: int,deadline: int = None):
+        if deadline is None:
+            deadline = int(time.time())+300
+        tickspacing=calculate_tickspacing_by_feetier(fee)
+        pool_key=self.build_pool_key(token0.address, token1.address, fee,tickspacing)
+        salt=self.make_salt(self.net.address,pool_key,tick_lower,tick_upper)
+        liquidity=calculate_liquidity_inside_range(tick_lower,tick_upper,amount0_desired,amount1_desired)
+        action,params= self.build_mint_liquidity(self.net.address,pool_key,tick_lower,tick_upper,liquidity,salt)
+        token0.ensure_allowance_smart(self.address,amount0_desired)
+        token1.ensure_allowance_smart(self.address,amount1_desired)
+        tx=self.modify_liquidities(action,params,deadline=deadline)
+        self.net.build_and_send_transaction_advanced(tx)
+    #
+    #
+    def full_exit(self,v4nft:LPPositionV4,deadline:int=None):
+        if deadline is None:
+            deadline=int(time.time())+300
+        nft_info=v4nft.info()
+        pool_key=self.build_pool_key(nft_info['token0'], nft_info['token1'],nft_info['fee'] ,nft_info['tickSpacing'])
+        salt=self.make_salt(self.net.address,pool_key,v4nft.tick_lower,v4nft.tick_upper)
+        action,params=self.build_collect_and_burn(self.net.address,pool_key,v4nft.tick_lower,v4nft.tick_upper,v4nft.liquidity,salt)
+        tx=self.modify_liquidities(action,params,deadline=deadline)
+        self.net.build_and_send_transaction_advanced(tx)
+    #
+    #
+    def swap_tokens(
+        self,
+        from_token: Token,
+        to_token: Token,
+        amount_in: int,
+        owner: str,
+        pool_key: tuple,
+        min_amount_out: int=0,
+        deadline: int = None,
+        use_native: bool = None
+    ):
+        """
+        Build and send a multicall for Permit + Swap only.
+        This does NOT mint liquidity.
+        
+        Args:
+            from_token: token to swap from (Token instance)
+            to_token: token to swap to (Token instance)
+            amount_in: amount of from_token to swap
+            min_amount_out: minimum acceptable amount of to_token
+            owner: address performing the swap
+            pool_key: pool_key tuple (token0, token1, fee, tickSpacing, hooks)
+            deadline: transaction deadline
+            use_native: True if from_token is native (ETH/MATIC/BNB)
+        """
+
+        if deadline is None:
+            deadline = int(time.time()) + 300
+
+        # 1️⃣ Prepare permit calldata if ERC20 (skip for native)
+        actions = []
+        params = []
+        use_native=True if from_token.is_native else False
+
+        if not use_native:
+            permit_salt = self.make_salt(owner, pool_key, 0, 0)  # dummy ticks for permit
+            permit_data = self.encode_permit(from_token.address, owner, self.address, amount_in, permit_salt, deadline)
+            actions.append(self.PERMIT)  # hypothetical PERMIT action constant
+            params.append(permit_data)
+
+        # 2️⃣ Prepare swap calldata
+        if use_native:
+            swap_data = self.encode_swap_native_to_token(to_token.address, amount_in, min_amount_out, pool_key,owner=owner)
+        else:
+            swap_data = self.encode_swap_erc20_to_erc20(from_token.address, to_token.address, amount_in, min_amount_out, pool_key,owner=owner)
+
+        actions.append(self.SWAP)  # hypothetical SWAP action constant
+        params.append(swap_data)
+        #
+        #
+        from_token.ensure_allowance_smart(self.address,amount=amount_in)
+        #
+        # 3️⃣ Build multicall
+        multicall_tx = self.build_multicall_liquidity_transaction(bytes(actions), params, deadline)
+
+        # 4️⃣ Attach value for native swap
+        if use_native:
+            multicall_tx['value'] = amount_in
+
+        # 5️⃣ Send transaction
+        self.net.build_and_send_transaction_advanced(multicall_tx)
+
+    #
+    #
+    def jit_mint(self,token0:Token,token1:Token,fee:int,slippage:float=0.01,step:int=None):
+
+        pool_info=self.pool_current_info(token0, token1, fee)
+        tickspacing=calculate_tickspacing_by_feetier(fee)
+        current_tick=pool_info['currentTick']
+        tick_lower, tick_upper = get_current_match_tick_range(current_tick,tickspacing,10,step=step)
+  
+        cp=calculate_raw_price_from_sqrt_price(pool_info['sqrtPriceX96'])
+        lp=calculate_raw_price_by_tick(tick_lower)
+        up=calculate_raw_price_by_tick(tick_upper)
+        token0.balance_of()
+        token1.balance_of()
+        bal0=token0.token_balance
+        bal1=token1.token_balance
+        res=calculate_required_amount_and_swap(cp,lp,up,bal0,bal1)
+        tick_after=pool_state_after_swap_simple(res['swap_details'],res['swap_amount'],pool_info['sqrtPriceX96'],pool_info['liquidity'])
+
+        if tick_after<tick_lower or tick_after>tick_upper:
+            raise RuntimeError("Tick out of range.")
+        if res['amount0_target']<1 or res['amount1_target']<1:
+            raise RuntimeError("Insufficient balance for JIT Zap minting.")
+
+        if res['swap_details']=='token0 -> token1':
+            swap_amount=int(res['swap_amount'])
+            if swap_amount/10**token0.decimals<0.0001:
+                pass
+            else:
+                print(f"Info: Swapping {res['amount0_target']} {token0.symbol} for {res['amount1_target']} {token1.symbol} to balance amounts.")
+                min_amount_out=int(res['amount1_target']*(1-slippage))
+                pool_key=self.build_pool_key(token0.address,token1.address,fee,tickspacing)
+                self.swap_tokens(token0,token1,swap_amount,min_amount_out,self.net.address,pool_key)
+
+        elif res['swap_details']=='token1 -> token0':
+            swap_amount=int(res['swap_amount'])
+            if swap_amount/10**token1.decimals<0.0001:
+                pass
+            else:
+                print(f"Info: Swapping {res['amount1_target']} {token1.symbol} for {res['amount0_target']} {token0.symbol} to balance amounts.")
+                router.swap_exact_input_single(token_in=token1, token_out=token0, fee=fee, amount_in=swap_amount, slippage=slippage)
+                min_amount_out=int(res['amount0_target']*(1-slippage))
+                pool_key=self.build_pool_key(token0.address,token1.address,fee,tickspacing)
+                self.swap_tokens(token1,token0,swap_amount,min_amount_out,self.net.address,pool_key)
+
+
+        
+        token0.balance_of()
+        token1.balance_of()
+        
+        self.mint(token0, token1, fee, tick_lower, tick_upper,token0.token_balance,token1.token_balance)
+#
+#
+#
+class V4PoolManager(BaseEntity):
+    def __init__(self, net: Web3_Network, abi_registry: ABIRegistry,V4_PM:PositionManager):
+        super().__init__(net)
+        self.net = net
+        self.abi_registry = abi_registry
+        self.v4_pm=V4_PM
+        self.address = V4_PM.contract.functions.poolManager().call()
+        self.contract = net.eth.contract(
+            address=self.address,
+            abi=self.abi_registry.GET_V4_POOL_MANAGER_ABI(self.address)
+        )
+    #
+    #
+    def build_state_view_contract(self,state_view_address: str):
+        self.state_view_address=self.net.to_checksum_address(state_view_address)
+        abi_=self.abi_registry.GET_ANY_CONTRACT_ABI(self.state_view_address)
+        self.state_view_contract=self.net.eth.contract(self.state_view_address,abi=abi_)
+    #
+    #
+    
+
+    def pool_current_info(self, token0=Token, token1=Token, fee:int=0, tick_spacing:int=None, hook_address: str="0x0000000000000000000000000000000000000000"):
+        pool_id=self.v4_pm.get_pool_id(token0, token1, fee, tick_spacing, hook_address)
+        slot0=self.state_view_contract.functions.getSlot0(pool_id).call()
+        liquidity=self.state_view_contract.functions.getLiquidity(pool_id).call()
+        return{
+            "token0":token0.address,
+            "token1":token1.address,
+            "fee":fee,
+            "tickSpacing":tick_spacing,
+            "poolId":pool_id,
+            "sqrtPriceX96":slot0[0],
+            "currentTick":slot0[1],
+            "liquidity":liquidity
+        }
+    #
+    #
+#
+#
+#
+class TransactionAnalyzer(BaseEntity):
+    def __init__(self, net: Web3_Network, abi_registry: ABIRegistry):
+        super().__init__(net)
+        self.abi_registry = abi_registry
+        self.etherscan_base = "https://api.etherscan.io/v2/api"
+
+    def fetch_all_transactions(self, startblock: int = 0, endblock: int = 99999999, page_size: int = 200) -> list:
+        all_txs = []
+        page = 1
+        while True:
+            params = {
+                "module": "account", "action": "txlist",
+                "address": self.net.address, "startblock": startblock,
+                "endblock": endblock, "page": page,
+                "offset": page_size, "sort": "asc",
+                "apikey": self.net.explorer_api_key, "chainid": self.net.chain_id
+            }
+            try:
+                resp = requests.get(self.etherscan_base, params=params, timeout=30)
+                data = resp.json()
+                result = data.get("result", [])
+                if not result or (isinstance(result, str) and result == ""):
+                    break
+                all_txs.extend(result)
+                if len(result) < page_size: break
+                page += 1
+                time.sleep(0.25)
+            except Exception as e:
+                print(f"Error fetching transactions: {e}")
+                break
+        self.all_transaction = all_txs
+        
+        os.makedirs('raw_transactions', exist_ok=True)
+        with open('raw_transactions/transactions.json', 'w') as f:
+            json.dump(all_txs, f, indent=4)
+        #return all_txs
+
+    def handle_bytes(self, obj):
+        """convert byte to string json"""
+        if isinstance(obj, dict):
+            return {k: self.handle_bytes(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self.handle_bytes(v) for v in obj]
+        elif isinstance(obj, bytes):
+            return "0x" + obj.hex()
+        return obj
+
+    def decode_transaction_logs(self, tx_hash: str) -> list:
+        try:
+            receipt = self.net.eth.get_transaction_receipt(tx_hash)
+            decoded_results = []
+            for log in receipt.get('logs', []):
+                contract_address = log['address']
+                abi = self.abi_registry.GET_ANY_CONTRACT_ABI(contract_address)
+                if not abi: continue
+
+                try:
+                    contract = self.net.eth.contract(address=contract_address, abi=abi)
+                    event_names = [e['name'] for e in abi if e['type'] == 'event']
+                    
+                    for event_name in event_names:
+                        try:
+                            decoded_log = contract.events[event_name]().process_log(log)
+                            decoded_results.append({
+                                "event_name": event_name,
+                                "contract": contract_address,
+                                "args": self.handle_bytes(dict(decoded_log['args'])), # استفاده از متد کلاس
+                                "blockNumber": log.get('blockNumber'),
+                                "transactionIndex": log.get('transactionIndex')
+                            })
+                            break 
+                        except: continue
+                except Exception as e:
+                    print(f"Internal decoding error at {contract_address}: {e}")
+            return decoded_results
+        except Exception as e:
+            print(f"Failed to fetch receipt for {tx_hash}: {e}")
+            return []
+
+    def get_wallet_history_report(self, last_n: int =None):
+        #
+        self.fetch_all_transactions()
+        if last_n is None:
+            last_n =len(self.all_transaction)
+        tx_list = self.all_transaction
+        report = []
+        
+        for tx in tx_list[-last_n:]:
+            tx_hash = tx['hash']
+            #
+            decoded_logs = self.decode_transaction_logs(tx_hash)
+            
+            report.append({
+                "hash": tx_hash,
+                "timestamp": tx.get('timeStamp'),
+                "function_name": tx.get('functionName'),
+                "status": "Success" if tx.get('isError') == '0' else "Failed",
+                "events": decoded_logs
+            })
+
+        self.report = report
+        os.makedirs('decoded_transactions', exist_ok=True)
+        with open('decoded_transactions/decoded_transactions.json', 'w') as f:
+            json.dump(report, f, indent=4)
+        print(f"✅ Report saved for last {len(report)} transactions.")
+#
+#
+class Wallet(Web3_Network, TransactionAnalyzer):
+    def __init__(self, net_instance: Web3_Network, abi_registry: ABIRegistry,scan_in_first:bool=True):
+        self.__dict__.update(net_instance.__dict__)
+        TransactionAnalyzer.__init__(self, net_instance, abi_registry)
+        
+        self.abi_registry = abi_registry
+        self.wallet_address = self.account.address if hasattr(self, 'account') else None
+        
+        # Internal Storage (Environment)
+        self.tokens = []           #
+        self.lp_positions_v3 = []  #
+        self.lp_positions_v4 = []  #
+        self.v4_positions_metadata = {}
+        self.v3_positions_metadata = {}
+        self.erc20_address=set()
+        
+        self.api_url = "https://api.etherscan.io/v2/api"
+
+        if scan_in_first and self.wallet_address:
+            self.discover_assets_optimize(debug=True)
+    #
+    #
+    def discover_assets_optimize(self, debug: bool = True):       
+        """
+        build wallet by scan all events
+        """
+        if debug: print(f"🔍 Starting asset discovery for {self.wallet_address}...")
+
+        self.get_wallet_history_report(last_n=100) 
+       
+        discovered_erc20_addresses = set()
+        
+        
+        v3_manager = getattr(self, 'position_manager_address', "").lower()
+        v4_manager = getattr(self, 'v4_position_manager_address', "").lower()
+
+        #
+        for tx in self.report:
+            if tx['status'] == "Failed": continue
+            v4_tx_token_id = None
+            v4_tx_metadata = None
+            
+
+            v3_tx_token_id=None
+            v3_temp={}
+            for event in tx.get('events', []):
+                event_name = event['event_name']
+                args = event['args']
+                contract = event['contract'].lower()
+
+                #
+                if event_name == "Transfer" and contract not in [v3_manager, v4_manager]:
+                    self.erc20_address.add(contract)
+
+
+                if contract == v4_manager and event_name == "Transfer":
+                    v4_tx_token_id = args.get('id') or args.get('tokenId')
+
+                if event_name == "ModifyLiquidity":
+                 
+                    v4_tx_metadata = {
+                        'poolId': args.get('id') or args.get('poolId'),
+                        'tickLower': args.get('tickLower'),
+                        'tickUpper': args.get('tickUpper'),
+                        'liquidityDelta': args.get('liquidityDelta'),
+                        'salt': args.get('salt'),
+                        
+                    }
+
+                #
+
+                if contract == v3_manager and event_name == "Transfer":
+                    tid = args.get('tokenId')
+                    if tid: v3_tx_token_id = tid
+
+
+                if event_name == "Mint":
+                    if args.get('owner').lower() == v3_manager:
+                        v3_temp.update({
+                            'tickLower': args.get('tickLower'),
+                            'tickUpper': args.get('tickUpper'),
+                            'contract': args.get('owner')
+                        })
+
+                if event_name == "IncreaseLiquidity" and contract == v3_manager:
+                    tid = args.get('tokenId')
+                    if tid:
+                        v3_temp.update({
+                            'liquidity': args.get('liquidity'),
+                            'amount0': args.get('amount0'),
+                            'amount1': args.get('amount1'),
+                            'tickLower': v3_temp['tickLower'],
+                            'tickUpper': v3_temp['tickUpper']
+                            #'contract': v3_temp['contract']
+                        })
+                
+            if v4_tx_token_id is not None and v4_tx_metadata is not None:
+                self.v4_positions_metadata[v4_tx_token_id] = v4_tx_metadata
+            if v4_tx_token_id is None and v4_tx_metadata is not None:
+                self.v4_positions_metadata['burn'] = v4_tx_metadata
+
+            if v3_temp and v3_tx_token_id:
+                self.v3_positions_metadata[v3_tx_token_id] = v3_temp
+
+
+
+
+        # 
+        #
+        discovered_erc20_addresses.add("0x0000000000000000000000000000000000000000")
+        
+        #
+        self.tokens = self._get_token_objects(self.wallet_address, self.erc20_address)
+
+        #
+        #
+
+        abi_v4=self.abi_registry.GET_V4_PM_ABI()
+        v4_pm_contract=self.net.eth.contract(address=self.net.v4_position_manager_address,abi=abi_v4)
+        for tid, meta in self.v4_positions_metadata.items():
+            time.sleep(0.2)
+            if tid == 'burn': continue
+            try:
+                if v4_pm_contract.functions.ownerOf(tid).call() == self.wallet_address:
+                    lp_v4 = LPPositionV4(self, self.abi_registry, tid, v4_manager, meta)
+                    if lp_v4.liquidity > 0:
+                        self.lp_positions_v4.append(lp_v4)
+            except Exception as e:
+                print(f"Error skipping V4 tid {tid}: {e}")
+
+        # 
+        abi_v3=self.abi_registry.GET_NFPM_ABI()
+        v3_pm_contract=self.net.eth.contract(address=self.net.position_manager_address,abi=abi_v3)
+        for tid, meta in self.v3_positions_metadata.items():
+            time.sleep(0.2)
+            try:
+                #
+                if v3_pm_contract.functions.ownerOf(tid).call() == self.wallet_address:
+                    lp_v3 = LPPosition(self.net,self.abi_registry,tid,metadata=meta)
+                    if lp_v3.liquidity > 0:
+                        self.lp_positions_v3.append(lp_v3)
+            except Exception as e:
+                print(f"Error skipping V3 tid {tid}: {e}")
+
+        if debug:
+            print(f"✅ Discovery finished: {len(self.tokens)} Tokens, {len(self.lp_positions_v3)} V3 LPs, {len(self.lp_positions_v4)} V4 LPs found.")
+    #
+    #
+    def discover_assets(self, wallet_address: str = None, debug: bool = True):
+        """
+        Scans history, creates objects, and stores them in the class instance.
+        """
+        target_address = wallet_address or self.wallet_address
+        if not target_address:
+            raise ValueError("No wallet address provided.")
+        
+        target_address = self.to_checksum_address(target_address)
+        discovered_erc20s = set()
+        discovered_nfts = {} 
+
+        common_params = {
+            "address": target_address, "sort": "desc",
+            "apikey": self.explorer_api_key, "chainid": self.chain_id
+        }
+
+        try:
+            # Fetch ERC20s
+            r_erc20 = requests.get(self.api_url, params={**common_params, "module": "account", "action": "tokentx"}).json()
+            #print(r_erc20)
+            if r_erc20.get("status") == "1":
+                for tx in r_erc20["result"]:
+                    discovered_erc20s.add(self.to_checksum_address(tx["contractAddress"]))
+
+            # Fetch NFTs
+            # Fetch ERC-721 NFTs (Like Uniswap v3 and some v4)
+            try:
+                #
+                r_721 = requests.get(self.api_url, params={**common_params, "module": "account", "action": "tokennfttx"}).json()
+                if r_721.get("status") == "1":
+                    for tx in r_721["result"]:
+                        contract = self.to_checksum_address(tx["contractAddress"])
+                        tid = int(tx["tokenID"])
+                        if contract not in discovered_nfts: discovered_nfts[contract] = []
+                        if tid not in discovered_nfts[contract]: discovered_nfts[contract].append(tid)
+
+                # 2
+                r_1155 = requests.get(self.api_url, params={**common_params, "module": "account", "action": "token1155tx"}).json()
+                if r_1155.get("status") == "1":
+                    for tx in r_1155["result"]:
+                        contract = self.to_checksum_address(tx["contractAddress"])
+                        #
+                        tid_raw = tx.get("tokenID") or tx.get("id")
+                        if tid_raw:
+                            tid = int(tid_raw)
+                            if contract not in discovered_nfts: discovered_nfts[contract] = []
+                            if tid not in discovered_nfts[contract]: discovered_nfts[contract].append(tid)
+
+                # 3
+                #
+                r_txs = requests.get(self.api_url, params={**common_params, "module": "account", "action": "txlist"}).json()
+                if r_txs.get("status") == "1":
+                    for tx in r_txs["result"]:
+                        # 
+                        if tx.get("isError") == "0" and tx.get("to") and tx.get("input") and tx["input"].startswith("0x"):
+                            contract_candidate = self.to_checksum_address(tx["to"])
+                            #
+                            if contract_candidate not in discovered_nfts:
+                                discovered_nfts[contract_candidate] = []
+
+            except Exception as e:
+                if debug: print(f"Scan Error during discovery: {e}")
+        except Exception as e:
+            if debug: print(f"Scan Error: {e}")
+
+        # Store in the instance instead of just returning
+        #print(list(discovered_erc20s))
+        
+        discovered_erc20s=list(discovered_erc20s)
+        discovered_erc20s.append("0x0000000000000000000000000000000000000000")
+        self.tokens = self._get_token_objects(target_address, discovered_erc20s)
+        self.all_lp_position=self._get_lp_position_objects(target_address, discovered_nfts)
+        self.erc20_tokens=list(discovered_erc20s)
+        self.nfts=discovered_nfts
+        
+        
+        if debug:
+            print(f"✅ Environment Updated: {len(self.tokens)} Tokens and {len(self.lp_positions_v3)} V3 LPs and {len(self.lp_positions_v4)} V4 LP Positions found.")
+        #return discovered_nfts
+    #
+    #ُ
+    def _get_token_objects(self, wallet_address, addresses):
+        objs = []
+        for addr in addresses:
+            time.sleep(0.2)
+            try:
+                t=Token(self.net,self.abi_registry,addr)
+
+                if t.token_balance > 0:
+                    objs.append(t)
+            except Exception as e:
+                print(f"Error skipping token {addr}: {e}")
+
+        #self.tokens=objs
+        return objs
+    #
+    #
+    def _get_lp_position_objects(self, wallet_address, nft_dict):
+        self.lp_positions_v3 = []
+        self.lp_positions_v4 = []
+        
+        v3_manager = getattr(self, 'position_manager_address', "").lower()
+        v4_manager = getattr(self, 'v4_position_manager_address', "").lower()
+        
+        # Standard ERC721 ABI for ownership check
+        owner_abi = [{"constant":True,"inputs":[{"name":"tokenId","type":"uint256"}],"name":"ownerOf","outputs":[{"name":"owner","type":"address"}],"type":"function"}]
+
+        for contract_addr, ids in nft_dict.items():
+            current_contract = contract_addr.lower()
+            
+            # --- Uniswap V3 Logic ---
+            if v3_manager and current_contract == v3_manager:
+                for tid in ids:
+                    try:
+                        temp_contract = self.eth.contract(address=self.to_checksum_address(current_contract), abi=owner_abi)
+                        if temp_contract.functions.ownerOf(tid).call().lower() == wallet_address.lower():
+                            lp_v3 = LPPosition(self, self.abi_registry, tid)
+                            self.lp_positions_v3.append(lp_v3)
+                    except: continue
+
+            # --- Uniswap V4 Logic ---
+            elif v4_manager and current_contract == v4_manager:
+                for tid in ids:
+                    try:
+                        temp_contract = self.eth.contract(address=self.to_checksum_address(current_contract), abi=owner_abi)
+                        if temp_contract.functions.ownerOf(tid).call().lower() == wallet_address.lower():
+                            # Initialize V4 specific class
+                            lp_v4 = LPPositionV4(self, self.abi_registry, tid, current_contract)
+                            self.lp_positions_v4.append(lp_v4)
+                    except: continue
+
+        return {"v3": self.lp_positions_v3, "v4": self.lp_positions_v4}
+
+    def get_summary(self):
+        """Returns a readable summary of current environment assets."""
+        return {
+            "tokens": [f"{t.symbol()}: {t.balanceOf() / 10**t.decimals()}" for t in self.tokens],
+            "lp_ids": [lp.nft_id for lp in self.lp_positions]
+        }
 #
 #
 #
@@ -2180,7 +4868,7 @@ class JITZAP(BaseEntity):
         
         token0.load()
         token1.load()
-        token0.ensure_allowance(self.address, amount0_total)
+        token0.ensure_allowance(self.address,amount0_total)
         token1.ensure_allowance(self.address, amount1_total)
 
         tx = self.contract.functions.executeJIT(
@@ -2252,8 +4940,8 @@ class JITZAP(BaseEntity):
             swap_amount=int(res['swap_amount'])
             #
             #
-
-            return self.execute_jit(
+            print('need to swap')
+            param=(
                 token0,
                 token1,
                 fee,
@@ -2268,8 +4956,11 @@ class JITZAP(BaseEntity):
                 amount0mint,
                 amount1mint
             )
+           
+            return self.execute_jit(*param)
         else:
-            return self.execute_jit(
+            print('no need to swap')
+            param=(
                 token0,
                 token1,
                 fee,
@@ -2278,9 +4969,13 @@ class JITZAP(BaseEntity):
                 amount0_total,
                 amount1_total,
                 False,
-                0,
+                False,
                 0,
                 0,
                 int(amount0_total* (1 - slippage)),
                 int(amount1_total* (1 - slippage))
             )
+          
+            return self.execute_jit(*param)
+            #
+            #
