@@ -23,6 +23,14 @@ from eth_account.messages import encode_typed_data
 from tqdm import tqdm
 import secrets
 from eth_abi.packed import encode_packed
+from requests.exceptions import RequestException
+from urllib3.exceptions import ProtocolError, MaxRetryError, NewConnectionError, SSLError, ReadTimeoutError
+from http.client import RemoteDisconnected
+import socket
+from uniswap_universal_router_decoder import FunctionRecipient, RouterCodec
+from eth_abi import encode as abi_encode
+
+#from uniswap_v4_position_manager_decoder import PositionManagerCodec
 
 
 
@@ -38,7 +46,7 @@ class Web3_Network(Web3):
 
     def __init__(self, rpc_url: str, private_key: str | None = None, explorer_api_key: str | None = None):
         
-        super().__init__(Web3.HTTPProvider(rpc_url))
+        super().__init__(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 60}))
 
         if not self.is_connected():
             raise ConnectionError("RPC connection failed")
@@ -65,6 +73,52 @@ class Web3_Network(Web3):
         )
         #
         self.get_explorer_api_url()
+    #
+    #
+    def safe_retry_call(self,fn, retries: int = 5, delay: float = 1.0, backoff: float = 2.0):
+        """
+        Executes a Web3 call function safely with retries and backoff on network/temporary RPC errors.
+        
+        Args:
+            fn: Lambda function to execute the Web3 call, e.g. `lambda: contract.functions.name().call()`
+            retries: Maximum number of attempts
+            delay: Initial delay between attempts (seconds)
+            backoff: Multiplier for exponential backoff
+
+        Returns:
+            Result of fn() if successful
+
+        Raises:
+            RuntimeError if all retries fail
+            ContractLogicError immediately if a contract logic error occurs
+        """
+        last_exc = None
+        for attempt in range(1, retries + 1):
+            try:
+                return fn()
+            except ContractLogicError as e:
+                #
+                raise
+            except (
+                RequestException,
+                OSError,
+                ValueError,
+                RemoteDisconnected,
+                ProtocolError,
+                MaxRetryError,
+                NewConnectionError,
+                SSLError,
+                ReadTimeoutError,
+                socket.timeout
+            ) as e:
+                last_exc = e
+                if attempt < retries:
+                    print(f"[Retry {attempt}/{retries}] Network error: {e}. Retrying in {delay}s...")
+                    time.sleep(delay)
+                    delay *= backoff
+                else:
+                    break
+        raise RuntimeError(f"Web3 call failed after {retries} attempts") from last_exc
     #
     #
     def get_explorer_api_url(self,inp_api_url: str=None):
@@ -480,6 +534,107 @@ class Web3_Network(Web3):
             else:
                 self.last_send_error = "🔴 Transaction reverted on-chain"
                 print(f"{self.last_send_error} | Check hash for details: {tx_hash_hex}")
+                return False
+
+        except Exception as e:
+            self.last_send_error = f"❌ Send/Sign Error: {e}"
+            print(self.last_send_error)
+            return False
+    #
+    #
+    def send_transaction_flexible(
+        self,
+        tx_func=None,
+        to_address: str | None = None,
+        raw_data: str | None = None,
+        value: int = 0,
+        gas_multiplier: float = 1.2,
+        wait_for_confirmation: bool = True,
+        manual_gas_limit: int = 1000000
+    ) -> str | bool:
+        """
+        Broadcasts a transaction in two modes:
+        1. Using a contract function object (tx_func)
+        2. Using raw calldata (raw_data) and a destination address (to_address)
+        """
+        sender = self.address
+        
+        # ---- 1) Initialize base transaction parameters ----
+        tx_params = {
+            'from': sender,
+            'value': value,
+            'nonce': self.eth.get_transaction_count(sender),
+            'chainId': self.chain_id
+        }
+
+        # Determine target address and calldata
+        if raw_data:
+            if not to_address:
+                raise ValueError("to_address is required when providing raw_data.")
+            tx_params['to'] = Web3.to_checksum_address(to_address)
+            tx_params['data'] = raw_data
+        elif tx_func:
+            # If tx_func is provided, 'to' and 'data' will be populated by build_transaction later
+            pass
+        else:
+            raise ValueError("Either tx_func or raw_data/to_address must be provided.")
+
+        # ---- 2) Gas Management (Estimate or Fallback) ----
+        try:
+            if tx_func:
+                estimated_gas = tx_func.estimate_gas({'from': sender, 'value': value})
+            else:
+                # Estimate gas for raw calldata
+                estimated_gas = self.eth.estimate_gas(tx_params)
+            
+            tx_params['gas'] = int(estimated_gas * gas_multiplier)
+        except Exception as e:
+            print(f"⚠️ Gas estimation failed: {e}. Using manual gas limit: {manual_gas_limit}")
+            tx_params['gas'] = manual_gas_limit
+
+        # ---- 3) Gas Pricing (EIP-1559 Support) ----
+        if self.network_gas_mode == 'EIP-1559':
+            latest_block = self.eth.get_block('latest')
+            base_fee = latest_block['baseFeePerGas']
+            priority_fee = self.eth.max_priority_fee
+            
+            tx_params['maxPriorityFeePerGas'] = priority_fee
+            tx_params['maxFeePerGas'] = int(base_fee * 2 + priority_fee)
+            tx_params['type'] = 2 # EIP-1559 Transaction
+        else:
+            tx_params['gasPrice'] = self.eth.gas_price
+
+        # ---- 4) Finalize Transaction Structure ----
+        try:
+            if tx_func:
+                # Convert function object to a complete transaction dictionary
+                final_tx = tx_func.build_transaction(tx_params)
+            else:
+                # Use the existing params dictionary for raw data execution
+                final_tx = tx_params
+        except Exception as e:
+            self.last_send_error = f"❌ Build Error: {e}"
+            print(self.last_send_error)
+            return False
+
+        # ---- 5) Signing and Broadcasting ----
+        try:
+            signed = self.account.sign_transaction(final_tx)
+            tx_hash = self.eth.send_raw_transaction(signed.raw_transaction)
+            tx_hash_hex = tx_hash.hex()
+            print(f"🚀 Transaction broadcasted! Hash: {tx_hash_hex}")
+
+            if not wait_for_confirmation:
+                return tx_hash_hex
+
+            # ---- 6) Confirmation Handling ----
+            receipt = self.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+            if receipt.status == 1:
+                print(f"✅ Confirmed in block {receipt.blockNumber}")
+                return tx_hash_hex
+            else:
+                self.last_send_error = "🔴 Transaction reverted on-chain"
+                print(f"{self.last_send_error} | Hash: {tx_hash_hex}")
                 return False
 
         except Exception as e:
@@ -1747,6 +1902,19 @@ class Token(BaseEntity):
         self.load()
     #
     #
+    def build_contract(self):
+        if hasattr(self,'address') and not self.is_native:
+            try:
+                self.contract=self.net.eth.contract(
+                    address=self.address,
+                    abi=self.abi_reg.GET_ERC20_ABI(self.address)
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to create ERC20 contract for {self.address}: {e}"
+                )
+    #
+    #
     def load(self):
         if self.is_native:
             self.name = "Native Ether"
@@ -1754,21 +1922,35 @@ class Token(BaseEntity):
             self.decimals = 18
             self.contract = None
             self.balance_of()
-        else:
-            erc20abi=self.abi_reg.GET_ERC20_ABI(self.address)
-            if erc20abi is None:
-                raise ValueError(f"Cannot load ERC20 ABI for {self.address}")
+            return
 
-            self.contract = self.net.eth.contract(
-                address=self.address,
-                abi=erc20abi
+        self.build_contract()
+
+        self.meta_data()
+        self.balance_of()
+    #
+    #
+    def meta_data(self):
+        if hasattr (self,'contract'):
+            self.name = self.net.safe_retry_call(
+                fn=lambda: self.contract.functions.name().call(),
+                retries=5,
+                delay=2
             )
 
-            self.name = self.contract.functions.name().call()
-            self.symbol = self.contract.functions.symbol().call()
-            self.decimals = self.contract.functions.decimals().call()
-            self.balance_of()
-    #
+            self.symbol = self.net.safe_retry_call(
+                fn=lambda: self.contract.functions.symbol().call(),
+                retries=5,
+                delay=2
+            )
+
+            self.decimals = self.net.safe_retry_call(
+                fn=lambda: self.contract.functions.decimals().call(),
+                retries=5,
+                delay=2
+            )
+
+
     #
     def balance_of(self, address: str=None) -> int:
         if address is None:
@@ -2507,8 +2689,7 @@ class UniversalRouter(BaseEntity):
             abi=self.abi_reg.GET_UNIVERSALROUTER_ABI(self.address)
         )
 
-        self.commands = bytearray()
-        self.inputs = []
+        self.codec=RouterCodec()
 
         # --- COMMANDS (Universal Router Top Level OpCodes) ---
         self.V4_SWAP = 0x10
@@ -2521,37 +2702,7 @@ class UniversalRouter(BaseEntity):
         self.ACTION_SETTLE_ALL = 0x0c      # Used for ERC20 payments
         self.ACTION_TAKE_ALL = 0x0f        # Used to receive output tokens
         self.ACTION_SETTLE_NATIVE = 0x0b   # Used for Native ETH payments
-    #
-    #
-    def encode_commands(self, commands):
-        return bytes(commands)
-    #
-    #
-    def encode_actions(self, actions):
-        return bytes(actions)
-    #
-    #
-    def encode_action_params(self, types, values):
-        return encode(types, values)
-    #
-    #
-    def encode_v4_swap_input(self, actions: bytes, params: list[bytes]) -> bytes:
-        # The UniversalRouter.v4Swap expects: (bytes actions, bytes[] params)
-        return encode(["bytes", "bytes[]"], [actions, params])
-        #
-    #
-    def build_execute_calldata(self, commands, inputs, deadline):
-
-        selector = keccak(text="execute(bytes,bytes[],uint256)")[:4]
-        
-        encoded_params = encode(
-            ["bytes", "bytes[]", "uint256"],
-            [commands, inputs, deadline]
-        )
-        
-        calldata = selector + encoded_params
-        print(f"DEBUG - Raw Calldata Created: {calldata.hex()}")
-        return calldata
+        self.ACTION_TAKE = 0x0e            # Used to receive output tokens
     #
     #
     def execute(self, commands: bytes, inputs: list[bytes], deadline: int, value: int = 0):
@@ -2561,6 +2712,7 @@ class UniversalRouter(BaseEntity):
         """
         # Create the function object without building/signing it yet
         tx_func = self.contract.functions.execute(commands, inputs, deadline)
+        return tx_func
         
         # Delegate the rest (gas, nonce, sign, send) to your advanced sender
         return self.net.build_and_send_transaction_advanced(
@@ -2636,38 +2788,6 @@ class UniversalRouter(BaseEntity):
         return v, r, s
     #
     #
-    def encode_permit2(self, token, amount, expiration, nonce, spender, sig_deadline, v, r, s):
-        # 
-        expiration = expiration & ((1 << 48) - 1)
-        nonce = nonce & ((1 << 48) - 1)
-        
-        #
-        r_bytes = r.to_bytes(32, 'big') if isinstance(r, int) else r
-        s_bytes = s.to_bytes(32, 'big') if isinstance(s, int) else s
-        v_byte = bytes([v])
-
-        #
-        encoded_struct = encode(
-            ["address", "uint160", "uint48", "uint48", "address", "uint256"],
-            [token, amount, expiration, nonce, spender, sig_deadline]
-        )
-        
-        return encoded_struct + r_bytes + s_bytes + v_byte
-    #
-    #
-    def encode_permit2_transfer_from(
-        self,
-        token: str,
-        from_addr: str,
-        to_addr: str,
-        amount: int
-    ):
-        return encode(
-            ["address", "address", "address", "uint160"],
-            [token, from_addr, to_addr, amount]
-        )
-    #
-    #
     def build_pool_key(self,token0: str, token1: str, fee: int, tickspacing: int=None, hooks: str = "0x0000000000000000000000000000000000000000"):
         if tickspacing is None:
             tickspacing = calculate_tickspacing_by_feetier(fee)
@@ -2681,525 +2801,172 @@ class UniversalRouter(BaseEntity):
         return (t0, t1, int(fee), int(tickspacing), self.net.to_checksum_address(hooks))
     #
     #
-    def swap_exact_in_v4(self, token_in: Token, token_out: Token, amount_in: int, min_out: int, owner: str, fee: int, deadline: int = None):
-        self.commands = bytearray()
-        self.inputs = []
-
-        if deadline is None:
-            deadline = int(time.time()) + 300
-
-        is_native = token_in.is_native
-        tx_value = amount_in if is_native else 0
+    def create_permit_signature(self, token_address):
+        """
+        Create a Permit2 signature for a specific transaction (needed for each swap)
+        """
+        token_address = Web3.to_checksum_address(token_address)
+        permit2_contract = self.net.eth.contract(address=self.net.permit2_address, abi=self.abi_reg.GET_ANY_CONTRACT_ABI(self.net.permit2_address))
+        
+        p2_amount, p2_expiration, p2_nonce = permit2_contract.functions.allowance(
+            self.net.address,
+            token_address,
+            self.address
+        ).call()
+        
+        print("p2_amount, p2_expiration, p2_nonce: ", p2_amount, p2_expiration, p2_nonce)
+        
+        allowance_amount = 2**160 - 1  # max/infinite
+        permit_data, signable_message = self.codec.create_permit2_signable_message(
+            token_address,
+            allowance_amount,
+            self.codec.get_default_expiration(),
+            p2_nonce,
+            self.address,
+            self.codec.get_default_deadline(),
+            self.net.eth.chain_id,
+        )
+        signed_message = self.net.account.sign_message(signable_message)
+        return permit_data, signed_message
+    #
+    #
+    def make_trade_unified(self, from_token: Token, to_token: Token, amount: int, fee: int, slippage: float = None, pool_version="v4"):
+        """
+        Execute a swap using Universal Router (Unified for V3 & V4).
+        Supports: Token->Token, Token->Native, Native->Token.
+        """
+        
+        # 0. Constants and Setup
         ADDRESS_ZERO = "0x0000000000000000000000000000000000000000"
-
-        # --- 1. FUNDING (Permit2 for ERC20) ---
-        # If the input is an ERC20, pull tokens from the user to this contract via Permit2
-        if not is_native:
-            transfer_cmd = self.encode_permit2_transfer_from(
-                token_in.address, owner, self.address, amount_in
-            )
-            self.commands.append(self.PERMIT2_TRANSFER_FROM)
-            self.inputs.append(transfer_cmd)
-
-        # --- 2. V4 POOL PREPARATION ---
-        pool_key = self.build_pool_key(token_in.address, token_out.address, fee)
-        zero_for_one = (token_in.address.lower() == pool_key[0].lower())
         
-        # --- 3. CONSTRUCT NESTED V4 ACTIONS ---
-        # Standard V4Router OpCodes
+        # Determine if tokens are Native (ETH/MATIC/etc.)
+        is_native_input = from_token.is_native
+        is_native_output = to_token.is_native
 
-        v4_actions = bytearray()
-        v4_params = []
+        # For V4, Native currency address MUST be ADDRESS_ZERO
+        # Ensure your Token objects return ADDRESS_ZERO if they are native, 
+        # otherwise we force it here for the protocol logic.
+        addr_in = ADDRESS_ZERO if is_native_input else from_token.address
+        addr_out = ADDRESS_ZERO if is_native_output else to_token.address
 
-        # Action A: SWAP (0x06)
-        v4_actions.append(self.ACTION_SWAP_EXACT_IN_SINGLE)
-        swap_params = encode(
-            ["(address,address,uint24,int24,address)", "bool", "uint128", "uint128", "bytes"],
-            [pool_key, zero_for_one, amount_in, min_out, b'']
-        )
-        v4_params.append(swap_params)
+        # 1. Balance & Allowance Checks
+        if not is_native_input:
+            balance = from_token.token_balance
+            if balance < amount:
+                raise ValueError(f"Insufficient balance. Have: {balance}, Need: {amount}")
 
-        # Action B: SETTLE (0x0b)
-        # Clear the debit created by the swap for the input token
-        v4_actions.append(self.ACTION_SETTLE_NATIVE)
-        if is_native:
-            # For Native ETH, payerIsUser is False (Router pays PoolManager using msg.value)
-            settle_params = encode(
-                ["address", "uint256", "bool"], 
-                [ADDRESS_ZERO, amount_in, False]
+            # Check Permit2 / Allowance
+            from_token.ensure_allowance_smart(self.address, amount)
+            print("Allowance check passed")
+
+            # Create Permit2 signature (Only needed for V3 or if V4 builder requires it explicitly)
+            # Note: Some V4 SDKs handle permit automatically if integrated, 
+            # but keeping your logic here is safe.
+            permit_data, signed_message = self.create_permit_signature(from_token.address)
+            if not permit_data or not signed_message:
+                print("Failed to create permit signature")
+                # Depending on SDK, you might proceed if allowance is infinite and direct transfer is used
+                # return None 
+        
+        amount_in_wei = amount
+        min_amount_out = 0  # Should be calculated based on slippage in a real app
+        
+        # Get deadline
+        deadline = self.net.eth.get_block("latest")["timestamp"] + 300
+
+        # 2. Logic Selection (V3 vs V4)
+        if pool_version.lower() == "v3":
+            # --- V3 Logic (Existing) ---
+            # Note: For V3, the router handles wrapping/unwrapping automatically via specific functions
+            # like v3_swap_exact_in (for tokens) or mixed logic.
+            # Assuming your codec handles generic V3 structures:
+            encoded_data = (
+                self.codec.encode.chain()
+                .permit2_permit(permit_data, signed_message) if (permit_data and signed_message) else self.codec.encode.chain()
+                .v4_swap_exact_in( # Use v3_swap_exact_in typically, ensuring method name matches your SDK
+                    FunctionRecipient.SENDER,
+                    amount_in_wei,
+                    min_amount_out,
+                    [
+                        from_token.address, # V3 typically uses WETH address, not Zero, unless using specific ETH funcs
+                        fee,
+                        to_token.address,
+                    ],
+                ).build(deadline)
             )
+
+        elif pool_version.lower() == "v4":
+            # --- V4 Logic (Unified) ---
+            
+            # A. Calculate Pool Key
+            tick_spacing = calculate_tickspacing_by_feetier(fee)
+            
+            # Important: Pool Key MUST use ADDRESS_ZERO for native tokens in V4
+            pool_key = self.codec.encode.v4_pool_key(
+                addr_in,
+                addr_out,
+                fee,
+                tick_spacing,
+            )
+            
+            # Determine ZeroForOne (Token0 < Token1 logic)
+            # We compare the sanitized addresses (where native is 0x00...00)
+            zero_for_one = int(addr_in, 16) < int(addr_out, 16)
+
+            # B. Start Building V4 Sequence
+            builder = self.codec.encode.chain().v4_swap()
+
+            # Action 1: Swap
+            # This calculates the swap amounts but doesn't move funds yet.
+            builder.swap_exact_in_single(
+                pool_key=pool_key,
+                zero_for_one=zero_for_one,
+                amount_in=amount_in_wei,
+                amount_out_min=min_amount_out,
+                hook_data=b'' 
+            )
+
+            # Action 2: Settle (Input Side)
+            # We must pay the PoolManager.
+            if is_native_input:
+                # User sends ETH with tx -> Router -> PoolManager.
+                # 'settle' with payer_is_user=True usually instructs to use available funds/msg.value
+                builder.settle(addr_in, amount_in_wei, payer_is_user=True)
+            else:
+                # Token Input. Use settle_all or settle.
+                # payer_is_user=True triggers the Pull (Permit2) from user to PM.
+                builder.settle(addr_in, amount_in_wei, payer_is_user=True)
+
+            # Action 3: Take (Output Side)
+            # We claim the output tokens from PoolManager.
+            if is_native_output:
+                # We take ETH. 
+                # In V4, taking Native 0x00..00 sends ETH to the recipient.
+                builder.take_all(addr_out, 0)
+            else:
+                # We take ERC20.
+                builder.take_all(addr_out, 0)
+
+            # C. Finalize Build
+            # Note: We don't need .sweep() usually in pure V4 if we used take_all pointing to SENDER.
+            encoded_data = builder.build_v4_swap().build(deadline)
+
         else:
-            # For ERC20, amount 0 tells the router to use the full balance pulled via Permit2
-            settle_params = encode(
-                ["address", "uint256", "bool"], 
-                [token_in.address, 0, False]
-            )
-        v4_params.append(settle_params)
+            raise ValueError("Unsupported pool_version. Use 'v3' or 'v4'.")
 
-        # Action C: TAKE_ALL (0x0f)
-        # Withdraw all bought tokens and send them to the owner
-        v4_actions.append(self.ACTION_TAKE_ALL)
-        # Params: Output token address and minimum amount expected (Slippage check)
-        take_params = encode(
-            ["address", "uint256"], 
-            [token_out.address, min_out]
-        )
-        v4_params.append(take_params)
+        print(f"Encoded Data: {encoded_data}")
 
-        # --- 4. PACKAGE V4 DATA ---
-        # Combine the byte array of actions and the array of encoded parameters
-        v4_encoded_input = encode(["bytes", "bytes[]"], [bytes(v4_actions), v4_params])
-
-        # Universal Router command for V4_SWAP is 0x10
-        self.commands.append(0x10) 
-        self.inputs.append(v4_encoded_input)
-
-        # --- 5. EXECUTION ---
-        return self.execute(
-            bytes(self.commands),
-            self.inputs,
-            deadline,
-            value=tx_value
-        )
-    #
-    #
-    def swap_exact_in_v4_2(self, token_in: Token, token_out: Token, amount_in: int, min_out: int, owner: str, fee: int, deadline: int = None):
-        self.commands = bytearray()
-        self.inputs = []
-
-        if deadline is None:
-            deadline = int(time.time()) + 300
-
-        is_native_in = token_in.is_native
-        is_native_out = token_out.is_native
+        # 3. Execute Transaction
+        # If input is native, we must send value with the transaction
+        tx_value = amount_in_wei if is_native_input else 0
         
-        # msg.value should only be amount_in if we are sending ETH
-        tx_value = amount_in if is_native_in else 0
-        ADDRESS_ZERO = "0x0000000000000000000000000000000000000000"
-
-        # --- 1. FUNDING ---
-        # If input is ERC20, pull tokens from user via Permit2
-        if not is_native_in:
-            transfer_cmd = self.encode_permit2_transfer_from(
-                token_in.address, owner, self.address, amount_in
-            )
-            self.commands.append(self.PERMIT2_TRANSFER_FROM) # 0x03
-            self.inputs.append(transfer_cmd)
-
-        # --- 2. V4 POOL PREPARATION ---
-        pool_key = self.build_pool_key(token_in.address, token_out.address, fee)
-        zero_for_one = (token_in.address.lower() == pool_key[0].lower())
-        
-        # --- 3. CONSTRUCT NESTED V4 ACTIONS ---
-        ACTION_SWAP_EXACT_IN_SINGLE = 0x06
-        ACTION_SETTLE = 0x0b 
-        ACTION_TAKE_ALL = 0x0f
-
-        v4_actions = bytearray()
-        v4_params = []
-
-        # Action A: SWAP
-        v4_actions.append(ACTION_SWAP_EXACT_IN_SINGLE)
-        swap_params = encode(
-            ["(address,address,uint24,int24,address)", "bool", "uint128", "uint128", "bytes"],
-            [pool_key, zero_for_one, amount_in, min_out, b'']
-        )
-        v4_params.append(swap_params)
-
-        # Action B: SETTLE (Paying the pool)
-        v4_actions.append(ACTION_SETTLE)
-        if is_native_in:
-            # PayerIsUser=False: Router uses msg.value
-            settle_params = encode(["address", "uint256", "bool"], [ADDRESS_ZERO, amount_in, False])
-        else:
-            # PayerIsUser=False: Router uses tokens pulled to its balance via Permit2
-            settle_params = encode(["address", "uint256", "bool"], [token_in.address, 0, False])
-        v4_params.append(settle_params)
-
-        # Action C: TAKE_ALL (Receiving from the pool)
-        v4_actions.append(ACTION_TAKE_ALL)
-        if is_native_out:
-            # To receive Native ETH, we MUST use ADDRESS_ZERO
-            take_params = encode(["address", "uint256"], [ADDRESS_ZERO, min_out])
-        else:
-            take_params = encode(["address", "uint256"], [token_out.address, min_out])
-        v4_params.append(take_params)
-
-        # --- 4. PACKAGE V4 DATA ---
-        v4_encoded_input = encode(["bytes", "bytes[]"], [bytes(v4_actions), v4_params])
-        self.commands.append(0x10) # V4_SWAP
-        self.inputs.append(v4_encoded_input)
-
-        # --- 5. EXECUTION ---
-        return self.execute(
-            bytes(self.commands),
-            self.inputs,
-            deadline,
-            value=tx_value
-        )
-    #
-    #
-    def swap_exact_in_v4_3(self, token_in: Token, token_out: Token, amount_in: int, min_out: int, owner: str, fee: int, deadline: int = None):
-        self.commands = bytearray()
-        self.inputs = []
-
-        if deadline is None:
-            deadline = int(time.time()) + 300
-
-        is_native_in = token_in.is_native
-        is_native_out = token_out.is_native
-        
-        # Value is only sent if the input is Native ETH
-        tx_value = amount_in if is_native_in else 0
-        ADDRESS_ZERO = "0x0000000000000000000000000000000000000000"
-
-        # --- 1. FUNDING ---
-        if not is_native_in:
-            # Command 0x03: PERMIT2_TRANSFER_FROM
-            transfer_cmd = self.encode_permit2_transfer_from(
-                token_in.address, owner, self.address, amount_in
-            )
-            self.commands.append(0x03)
-            self.inputs.append(transfer_cmd)
-
-        # --- 2. V4 POOL PREPARATION ---
-        pool_key = self.build_pool_key(token_in.address, token_out.address, fee)
-        zero_for_one = (token_in.address.lower() == pool_key[0].lower())
-        
-        # --- 3. CONSTRUCT NESTED V4 ACTIONS ---
-        ACTION_SWAP_EXACT_IN_SINGLE = 0x06
-        ACTION_SETTLE = 0x0b 
-        ACTION_TAKE_ALL = 0x0f
-
-        v4_actions = bytearray()
-        v4_params = []
-
-        # Action A: SWAP
-        # Note: V4 SWAP_EXACT_IN_SINGLE expects: (PoolKey, zeroForOne, amountIn, amountOutMinimum, hookData)
-        v4_actions.append(ACTION_SWAP_EXACT_IN_SINGLE)
-        swap_params = encode(
-            ["(address,address,uint24,int24,address)", "bool", "uint128", "uint128", "bytes"],
-            [pool_key, zero_for_one, amount_in, min_out, b'']
-        )
-        v4_params.append(swap_params)
-
-        # Action B: SETTLE
-        v4_actions.append(ACTION_SETTLE)
-        if is_native_in:
-            # Currency, Amount, PayerIsUser
-            settle_params = encode(["address", "uint256", "bool"], [ADDRESS_ZERO, amount_in, False])
-        else:
-            # Currency, Amount (0 = all), PayerIsUser
-            settle_params = encode(["address", "uint256", "bool"], [token_in.address, 0, False])
-        v4_params.append(settle_params)
-
-        # Action C: TAKE_ALL
-        v4_actions.append(ACTION_TAKE_ALL)
-        # Currency, minAmount
-        out_currency = ADDRESS_ZERO if is_native_out else token_out.address
-        take_params = encode(["address", "uint256"], [out_currency, min_out])
-        v4_params.append(take_params)
-
-        # --- 4. PACKAGE V4 DATA (CRITICAL STEP) ---
-        # The Universal Router command 0x10 expects a single bytes blob 
-        # which is the encoding of (bytes actions, bytes[] params)
-        v4_encoded_input = encode(["bytes", "bytes[]"], [bytes(v4_actions), v4_params])
-
-        self.commands.append(0x10) # V4_SWAP
-        self.inputs.append(v4_encoded_input)
-
-        # --- 5. EXECUTION ---
-        return self.execute(
-            bytes(self.commands),
-            self.inputs,
-            deadline,
-            value=tx_value
-        )
-    #
-    #
-    def swap_exact_in_v4_4(self, token_in: Token, token_out: Token, amount_in: int, min_out: int, owner: str, fee: int, deadline: int = None):
-        self.commands = bytearray()
-        self.inputs = []
-
-        if deadline is None:
-            deadline = int(time.time()) + 300
-
-        is_native_in = token_in.is_native
-        is_native_out = token_out.is_native
-        tx_value = amount_in if is_native_in else 0
-        ADDRESS_ZERO = "0x0000000000000000000000000000000000000000"
-
-        # --- 1. FUNDING ---
-        if not is_native_in:
-            # Command 0x03: PERMIT2_TRANSFER_FROM
-            transfer_cmd = self.encode_permit2_transfer_from(
-                token_in.address, owner, self.address, amount_in
-            )
-            self.commands.append(0x03)
-            self.inputs.append(transfer_cmd)
-
-        # --- 2. V4 POOL PREPARATION ---
-        pool_key = self.build_pool_key(token_in.address, token_out.address, fee)
-        zero_for_one = (token_in.address.lower() == pool_key[0].lower())
-        
-        # --- 3. CONSTRUCT NESTED V4 ACTIONS ---
-        ACTION_SWAP_EXACT_IN_SINGLE = 0x06
-        ACTION_SETTLE = 0x0b 
-        ACTION_TAKE_ALL = 0x0f
-
-        v4_actions = bytearray()
-        v4_params = []
-
-        # Action A: SWAP
-        v4_actions.append(ACTION_SWAP_EXACT_IN_SINGLE)
-        v4_params.append(encode(
-            ["(address,address,uint24,int24,address)", "bool", "uint128", "uint128", "bytes"],
-            [pool_key, zero_for_one, amount_in, min_out, b'']
-        ))
-
-        # Action B: SETTLE
-        v4_actions.append(ACTION_SETTLE)
-        currency_in = ADDRESS_ZERO if is_native_in else token_in.address
-        # For ERC20 sell: amount=0 (full balance), payerIsUser=False (already in router)
-        v4_params.append(encode(["address", "uint256", "bool"], [currency_in, 0 if not is_native_in else amount_in, False]))
-
-        # Action C: TAKE_ALL
-        v4_actions.append(ACTION_TAKE_ALL)
-        currency_out = ADDRESS_ZERO if is_native_out else token_out.address
-        v4_params.append(encode(["address", "uint256"], [currency_out, min_out]))
-
-        # --- 4. PACKAGE V4 DATA (THE FIX) ---
-        # Universal Router expects V4_SWAP input to be: 
-        # abi.encode(actions, params) -> where actions is bytes and params is bytes[]
-        v4_nested_input = encode(["bytes", "bytes[]"], [bytes(v4_actions), v4_params])
-
-        self.commands.append(0x10) # V4_SWAP
-        self.inputs.append(v4_nested_input)
-
-        # --- 5. EXECUTION ---
-        # Ensure commands is a bytes object
-        return self.execute(
-            bytes(self.commands),
-            self.inputs,
-            deadline,
-            value=tx_value
-        )
-    #
-    #
-    def swap_exact_in_v4_5(self, token_in: Token, token_out: Token, amount_in: int, min_out: int, owner: str, fee: int, deadline: int = None):
-        self.commands = bytearray()
-        self.inputs = []
-
-        if deadline is None:
-            deadline = int(time.time()) + 300
-
-        is_native_in = token_in.is_native
-        is_native_out = token_out.is_native
-        tx_value = amount_in if is_native_in else 0
-        ADDRESS_ZERO = "0x0000000000000000000000000000000000000000"
-
-        # --- Universal Router Top-Level Commands ---
-        CMD_PERMIT2_TRANSFER_FROM = 0x03
-        CMD_V4_SWAP = 0x10
-        CMD_SWEEP = 0x04
-
-        # --- V4 Router Nested Actions ---
-        ACTION_SWAP_EXACT_IN_SINGLE = 0x06
-        ACTION_SETTLE = 0x0b 
-        ACTION_TAKE_ALL = 0x0f # Using 0x0f (Standard Encode) instead of 0x0c (Packed)
-
-        # ---------------------------------------------------------
-        # 1. FUNDING (Input)
-        # ---------------------------------------------------------
-        if not is_native_in:
-            # FIX from Code 5: Use 3 arguments for Command 0x03 (token, recipient, amount)
-            # This pulls tokens from User -> UniversalRouter
-            transfer_cmd = encode(
-                ["address", "address", "uint256"],
-                [token_in.address, self.address, amount_in]
-            )
-            self.commands.append(CMD_PERMIT2_TRANSFER_FROM)
-            self.inputs.append(transfer_cmd)
-
-        # ---------------------------------------------------------
-        # 2. V4 ACTIONS (Nested in Command 0x10)
-        # ---------------------------------------------------------
-        v4_actions = bytearray()
-        v4_params = []
-        
-        # Prepare Pool Key
-        pool_key = self.build_pool_key(token_in.address, token_out.address, fee)
-        zero_for_one = (token_in.address.lower() == pool_key[0].lower())
-
-        # Action A: SWAP (0x06)
-        v4_actions.append(ACTION_SWAP_EXACT_IN_SINGLE)
-        swap_params = encode(
-            ["(address,address,uint24,int24,address)", "bool", "uint128", "uint128", "bytes"],
-            [pool_key, zero_for_one, amount_in, min_out, b'']
-        )
-        v4_params.append(swap_params)
-
-        # Action B: SETTLE (0x0b)
-        # Settle debt with PoolManager.
-        # Standard ABI Encode (3 params).
-        v4_actions.append(ACTION_SETTLE)
-        if is_native_in:
-            # Native: payerIsUser=False (Router pays from msg.value)
-            settle_params = encode(["address", "uint256", "bool"], [ADDRESS_ZERO, amount_in, False])
-        else:
-            # Token: payerIsUser=False (Router pays from balance pulled via Permit2)
-            # amount=0 implies "use full balance recorded in delta"
-            settle_params = encode(["address", "uint256", "bool"], [token_in.address, 0, False])
-        v4_params.append(settle_params)
-
-        # Action C: TAKE_ALL (0x0f)
-        # Claim output from PoolManager to UniversalRouter.
-        # Using 0x0f (TAKE_ALL) allows Standard ABI Encoding (Safer than 0x0c Packed).
-        v4_actions.append(ACTION_TAKE_ALL)
-        currency_out = ADDRESS_ZERO if is_native_out else token_out.address
-        take_params = encode(["address", "uint256"], [currency_out, min_out])
-        v4_params.append(take_params)
-
-        # Wrap V4 Actions
-        v4_encoded_input = encode(["bytes", "bytes[]"], [bytes(v4_actions), v4_params])
-        self.commands.append(CMD_V4_SWAP)
-        self.inputs.append(v4_encoded_input)
-
-        # ---------------------------------------------------------
-        # 3. SWEEP (Output)
-        # ---------------------------------------------------------
-        # TAKE_ALL moved funds to the Router. Now we must sweep them to the User.
-        # This handles both ERC20 and Native ETH output.
-        sweep_token = ADDRESS_ZERO if is_native_out else token_out.address
-        sweep_cmd = encode(
-            ["address", "address", "uint256"],
-            [sweep_token, owner, min_out]
-        )
-        self.commands.append(CMD_SWEEP)
-        self.inputs.append(sweep_cmd)
-
-        # ---------------------------------------------------------
-        # 4. EXECUTION
-        # ---------------------------------------------------------
-        return self.execute(
-            bytes(self.commands),
-            self.inputs,
-            deadline,
-            value=tx_value
-        )
-    #
-    #
-    def swap_exact_in5(self, token_in: Token, token_out: Token, amount_in: int, min_out: int, owner: str, fee: int, deadline: int = None):
-        self.commands = bytearray()
-        self.inputs = []
-
-        if deadline is None:
-            deadline = int(time.time()) + 300
-
-        is_native = token_in.is_native
-        tx_value = amount_in if is_native else 0
-        ADDRESS_ZERO = "0x0000000000000000000000000000000000000000"
-
-        # --- 1. FUNDING (Permit2 for ERC20) ---
-        if not is_native:
-            transfer_cmd = self.encode_permit2_transfer_from(
-                token_in.address, owner, self.address, amount_in
-            )
-            self.commands.append(self.PERMIT2_TRANSFER_FROM)
-            self.inputs.append(transfer_cmd)
-
-        # --- 2. V4 POOL PREPARATION ---
-        pool_key = self.build_pool_key(token_in.address, token_out.address, fee)
-        zero_for_one = (token_in.address.lower() == pool_key[0].lower())
-        
-        # --- 3. CONSTRUCT NESTED V4 ACTIONS ---
-        # OpCodes استاندارد V4Router
-        ACTION_SWAP_EXACT_IN_SINGLE = 0x06
-        ACTION_SETTLE = 0x0b      # تسویه ورودی
-        ACTION_TAKE_ALL = 0x0f    # برداشت تمام خروجی (بسیار امن‌تر از TAKE)
-
-        v4_actions = bytearray()
-        v4_params = []
-
-        # Action A: SWAP (0x06)
-        v4_actions.append(ACTION_SWAP_EXACT_IN_SINGLE)
-        swap_params = encode(
-            ["(address,address,uint24,int24,address)", "bool", "uint128", "uint128", "bytes"],
-            [pool_key, zero_for_one, amount_in, min_out, b'']
-        )
-        v4_params.append(swap_params)
-
-        # Action B: SETTLE (0x0b)
-        # تسویه کردن مبلغ ورودی با استخر
-        v4_actions.append(ACTION_SETTLE)
-        if is_native:
-            # برای ETH مقدار payerIsUser باید False باشد چون روتر از msg.value پرداخت می‌کند
-            settle_params = encode(
-                ["address", "uint256", "bool"], 
-                [ADDRESS_ZERO, amount_in, False]
-            )
-        else:
-            # برای ERC20 مقدار 0 به معنی کل موجودی است که روتر از کاربر کشیده است
-            settle_params = encode(
-                ["address", "uint256", "bool"], 
-                [token_in.address, 0, False]
-            )
-        v4_params.append(settle_params)
-
-        # Action C: TAKE_ALL (0x0f)
-        # برداشت تمام توکن‌های خریداری شده و ارسال به کاربر
-        v4_actions.append(ACTION_TAKE_ALL)
-        # پارامترها: آدرس توکن خروجی و حداقل مقدار مورد انتظار (Slippage check)
-        take_params = encode(
-            ["address", "uint256"], 
-            [token_out.address, min_out]
-        )
-        v4_params.append(take_params)
-
-        # --- 4. PACKAGE V4 DATA ---
-        v4_encoded_input = encode(["bytes", "bytes[]"], [bytes(v4_actions), v4_params])
-
-        # Universal Router command for V4_SWAP is 0x10
-        self.commands.append(0x10) 
-        self.inputs.append(v4_encoded_input)
-
-        # --- 5. EXECUTION ---
-        return self.execute(
-            bytes(self.commands),
-            self.inputs,
-            deadline,
-            value=tx_value
-        )
-    #
-    #
-
-    def get_permit2_domain(self):
-        return {
-            "name": "Permit2",
-            "chainId": self.net.chain_id,
-            "verifyingContract": self.net.permit2_address
-        }
-    #
-    #
-    def encode_settle_pair(self, currency0: str, currency1: str):
-        return encode(
-            ["address", "address"],
-            [currency0, currency1]
-        )
-    #
-    #
-    def encode_v4_settle(self, currency: str, amount: int, payer_is_user: bool):
-        return encode(
-            ["address", "uint256", "bool"],
-            [currency, amount, payer_is_user]
-        )
-    #
-    #
-    def encode_v4_take(self, currency: str, recipient: str, amount: int):
-        return encode(
-            ["address", "address", "uint256"],
-            [currency, recipient, amount]
-        )
+        # self.net.send_transaction_flexible(
+        #     to_address=self.address, 
+        #     raw_data=encoded_data, 
+        #     value=tx_value
+        # )
+        self.net.send_transaction_flexible(to_address=self.address,raw_data=encoded_data,value=tx_value)
+        #return encoded_data
     #
     #
 #
